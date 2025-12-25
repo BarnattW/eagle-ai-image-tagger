@@ -1,0 +1,15 @@
+{
+    "id": "a5a18212-4847-476c-961f-4550ab8b299b",
+    "version": "1.0.0",
+    "platform": "all",
+    "arch": "all",
+    "name": "Image Auto-Tagger",
+    "logo": "/logo.png",
+    "keywords": [],
+    "devTools": false,
+    "main": {
+        "url": "index.html",
+        "width": 960,
+        "height": 640
+    }
+}
