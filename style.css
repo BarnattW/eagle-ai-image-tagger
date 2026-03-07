@@ -85,3 +85,8 @@
 .custom-scrollbar::-webkit-scrollbar-thumb:hover {
   background: var(--btn-bg-hover);
 }
+
+/* Range input */
+.accent-slider {
+  accent-color: var(--accent);
+}

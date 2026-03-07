@@ -1,12 +1,7 @@
 const tabs = [
-  {
-    name: "Auto Tag",
-    id: "auto",
-  },
-  {
-    name: "Plugin Settings",
-    id: "settings",
-  },
+  { name: "Auto Tag", id: "auto" },
+  { name: "Gallery", id: "gallery" },
+  { name: "Plugin Settings", id: "settings" },
 ];
 
 const Sidebar = ({ activeSection, onTabChange }) => (

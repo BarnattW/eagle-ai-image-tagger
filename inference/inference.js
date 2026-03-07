@@ -3,8 +3,33 @@ const sharp = require("sharp");
 const fs = require("fs");
 const path = require("path");
 
-const modelPath = path.join(__dirname, "model.onnx");
-const labelPath = path.join(__dirname, "selected_tags.csv");
+let config = {
+  modelPath: path.join(__dirname, "model.onnx"),
+  tagsPath: path.join(__dirname, "selected_tags.csv"),
+  thresholdGeneral: 0.6,
+  thresholdCharacter: 0.9,
+  topN: 15,
+};
+
+function configure(newConfig) {
+  const pathChanged =
+    (newConfig.modelPath && newConfig.modelPath !== config.modelPath) ||
+    (newConfig.tagsPath && newConfig.tagsPath !== config.tagsPath);
+
+  config = {
+    modelPath: newConfig.modelPath || config.modelPath,
+    tagsPath: newConfig.tagsPath || config.tagsPath,
+    thresholdGeneral: newConfig.thresholdGeneral ?? config.thresholdGeneral,
+    thresholdCharacter: newConfig.thresholdCharacter ?? config.thresholdCharacter,
+    topN: newConfig.topN ?? config.topN,
+  };
+
+  if (pathChanged) {
+    session = null;
+    MODEL_LABELS = [];
+    console.log("Model config updated, session will reinitialize on next run.");
+  }
+}
 
 let session = null;
 let MODEL_LABELS = [];
@@ -12,7 +37,7 @@ let MODEL_LABELS = [];
 /* Initializes the auto-tag model singleton */
 async function initTagger() {
   if (!session) {
-    session = await ort.InferenceSession.create(modelPath);
+    session = await ort.InferenceSession.create(config.modelPath);
     console.log("Auto-tagger model loaded.");
   }
   return session;
@@ -22,7 +47,7 @@ async function initTagger() {
 function loadLabels() {
   if (MODEL_LABELS.length) return MODEL_LABELS;
 
-  const text = fs.readFileSync(labelPath, "utf8");
+  const text = fs.readFileSync(config.tagsPath, "utf8");
   const lines = text.trim().split("\n").slice(1);
   MODEL_LABELS = lines.map((line) => {
     const [id, name, cat] = line.split(",");
@@ -56,14 +81,9 @@ async function preprocessImage(imagePath) {
   return new ort.Tensor("float32", bgr, [1, size, size, 3]);
 }
 
-/* Remove duplicates (compare with existing tags on image), personalize based on user's tag list*/
 /* Run the inference */
-async function runTagger(
-  imagePath,
-  thresholdGeneral = 0.6,
-  thresholdCharacter = 0.9,
-  topN = 15 // to-do: update to config file
-) {
+async function runTagger(imagePath) {
+  const { thresholdGeneral, thresholdCharacter, topN } = config;
   if (session === null) session = await initTagger();
   const labels = loadLabels();
   const inputTensor = await preprocessImage(imagePath);
@@ -115,9 +135,10 @@ async function runTaggerLatest(imagePath) {
 
     return tags;
   } catch (err) {
+    if (myId !== currentTaskId) return null; // stale — discard silently
     console.error("runTagger failed:", err);
-    return null;
+    throw err;
   }
 }
 
-module.exports = { runTaggerLatest };
+module.exports = { runTaggerLatest, configure };

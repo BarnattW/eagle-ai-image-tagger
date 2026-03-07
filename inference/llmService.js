@@ -1,0 +1,219 @@
+const fs = require("fs");
+const path = require("path");
+
+const DEFAULT_PROMPT =
+  `Analyze this image and generate 15-25 accurate Danbooru-style tags.\n` +
+  `Cover all of the following categories that apply:\n` +
+  `- Subject: 1girl, 1boy, multiple girls, no humans, animal, etc.\n` +
+  `- Art style: anime, manga, realistic, painterly, sketch, chibi, pixel art, etc.\n` +
+  `- Character: hair color/length/style, eye color, skin tone, facial expression\n` +
+  `- Clothing & accessories: specific garment names, colors, patterns\n` +
+  `- Pose & body: standing, sitting, lying, arms up, from behind, close-up, full body, etc.\n` +
+  `- Action: looking at viewer, holding, eating, fighting, etc.\n` +
+  `- Lighting: soft lighting, backlight, rim light, dramatic shadow, dark, bright, etc.\n` +
+  `- Colors: dominant colors, monochrome, colorful, pastel, warm tones, etc.\n` +
+  `- Background: simple background, outdoors, indoors, specific location\n` +
+  `- Composition: portrait, dutch angle, wide shot, from above, from below\n` +
+  `- Mood: happy, sad, serious, romantic, action, peaceful\n` +
+  `Be specific and accurate. Only tag what is clearly visible. Do not guess.`;
+
+const DEFAULT_MODELS = {
+  openai: "gpt-4o-mini",
+  anthropic: "claude-haiku-4-5-20251001",
+};
+
+let llmConfig = {
+  enabled: false,
+  provider: "openai",
+  apiKey: "",
+  model: "",
+  endpoint: "http://localhost:1234/v1",
+  prompt: "",
+  includeLibraryTags: true,
+};
+
+function configure(patch) {
+  llmConfig = { ...llmConfig, ...patch };
+}
+
+function imageToBase64(imagePath) {
+  return fs.readFileSync(imagePath).toString("base64");
+}
+
+function getMimeType(imagePath) {
+  const ext = path.extname(imagePath).toLowerCase();
+  return (
+    {
+      ".jpg": "image/jpeg",
+      ".jpeg": "image/jpeg",
+      ".png": "image/png",
+      ".webp": "image/webp",
+      ".gif": "image/gif",
+    }[ext] || "image/jpeg"
+  );
+}
+
+function buildPrompt(userTags) {
+  const base = llmConfig.prompt.trim() || DEFAULT_PROMPT;
+  if (llmConfig.includeLibraryTags && userTags?.length > 0) {
+    const tagList = userTags.slice(0, 150).join(", ");
+    return (
+      `${base}\n\n` +
+      `STEP 2 — Library matching:\n` +
+      `From this list of my existing tags: ${tagList}\n` +
+      `Select ONLY tags that are a direct, confident match to something clearly visible in this image.\n` +
+      `Rules: do not include a library tag unless you are certain it applies. Prefer no matches over wrong matches.\n\n` +
+      `Return JSON: {"tags": ["tag1", ...], "library": ["tag1", ...]}`
+    );
+  }
+  return `${base}\n\nReturn only a JSON array: ["tag1", "tag2", ...]`;
+}
+
+async function callOpenAI(
+  base64Image,
+  mimeType,
+  prompt,
+  model,
+  apiKey,
+  baseUrl = "https://api.openai.com/v1",
+) {
+  const url = `${baseUrl.replace(/\/$/, "")}/chat/completions`;
+  console.log("Making OpenAI request to url:", url);
+  const headers = { "Content-Type": "application/json" };
+  if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: model || DEFAULT_MODELS.openai,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "image_url",
+              image_url: {
+                url: `data:${mimeType};base64,${base64Image}`,
+                detail: "low",
+              },
+            },
+            { type: "text", text: prompt },
+          ],
+        },
+      ],
+      max_tokens: 512,
+    }),
+  });
+  if (!response.ok)
+    throw new Error(`OpenAI ${response.status}: ${await response.text()}`);
+  return (await response.json()).choices[0].message.content;
+}
+
+async function callAnthropic(base64Image, mimeType, prompt, model, apiKey) {
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: model || DEFAULT_MODELS.anthropic,
+      max_tokens: 512,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "image",
+              source: {
+                type: "base64",
+                media_type: mimeType,
+                data: base64Image,
+              },
+            },
+            { type: "text", text: prompt },
+          ],
+        },
+      ],
+    }),
+  });
+  if (!response.ok)
+    throw new Error(`Anthropic ${response.status}: ${await response.text()}`);
+  return (await response.json()).content[0].text;
+}
+
+function parseTags(rawText, hasLibrary) {
+  try {
+    const cleaned = rawText.replace(/```json\n?|\n?```/g, "").trim();
+    const parsed = JSON.parse(cleaned);
+    if (hasLibrary) {
+      return {
+        tags: Array.isArray(parsed.tags) ? parsed.tags : [],
+        library: Array.isArray(parsed.library) ? parsed.library : [],
+      };
+    }
+    if (Array.isArray(parsed)) return { tags: parsed, library: [] };
+    const first = Object.values(parsed)[0];
+    return { tags: Array.isArray(first) ? first : [], library: [] };
+  } catch {
+    const match = rawText.match(/\[[\s\S]*?\]|\{[\s\S]*?\}/);
+    if (match) {
+      try {
+        const parsed = JSON.parse(match[0]);
+        if (Array.isArray(parsed)) return { tags: parsed, library: [] };
+        return {
+          tags: Array.isArray(parsed.tags) ? parsed.tags : [],
+          library: Array.isArray(parsed.library) ? parsed.library : [],
+        };
+      } catch {}
+    }
+    return { tags: [], library: [] };
+  }
+}
+
+async function llmGenerateTags(imagePath, userTags = []) {
+  const isLocal = llmConfig.provider === "local";
+  if (!llmConfig.enabled || (!isLocal && !llmConfig.apiKey) || !imagePath)
+    return { tags: [], library: [] };
+
+  try {
+    const base64Image = imageToBase64(imagePath);
+    const mimeType = getMimeType(imagePath);
+    const hasLibrary = llmConfig.includeLibraryTags && userTags.length > 0;
+    const prompt = buildPrompt(hasLibrary ? userTags : null);
+    const model =
+      llmConfig.model ||
+      DEFAULT_MODELS[llmConfig.provider] ||
+      DEFAULT_MODELS.openai;
+
+    const rawText =
+      llmConfig.provider === "anthropic"
+        ? await callAnthropic(
+            base64Image,
+            mimeType,
+            prompt,
+            model,
+            llmConfig.apiKey,
+          )
+        : await callOpenAI(
+            base64Image,
+            mimeType,
+            prompt,
+            model,
+            llmConfig.apiKey,
+            isLocal ? llmConfig.endpoint : undefined,
+          );
+
+    const { tags, library } = parseTags(rawText, hasLibrary);
+    return {
+      tags: tags.filter((t) => typeof t === "string" && t.trim()),
+      library: library.filter((t) => typeof t === "string" && t.trim()),
+    };
+  } catch (err) {
+    console.error("LLM error:", err.message);
+    throw err;
+  }
+}
+
+module.exports = { llmGenerateTags, configure, DEFAULT_PROMPT };
