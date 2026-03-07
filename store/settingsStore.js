@@ -8,7 +8,8 @@ export const useSettingsStore = create(
       inferenceMode: "local", // "local" | "llm"
 
       // --- Local mode: WD14 ---
-      modelPath: "",
+      wd14ModelDir: "", // folder containing model.onnx + selected_tags.csv
+      modelPath: "",    // legacy: explicit file paths (used if wd14ModelDir is empty)
       tagsPath: "",
       thresholdGeneral: 0.6,
       thresholdCharacter: 0.9,
@@ -27,6 +28,11 @@ export const useSettingsStore = create(
       llmEndpoint: "http://localhost:1234/v1", // used when provider = "local"
       llmPrompt: "", // empty = use built-in default
       llmIncludeLibraryTags: true,
+      promptPresets: [], // [{ name: string, prompt: string }]
+
+      // --- General ---
+      autoSave: false,
+      tagBlacklist: [], // string[]
 
       update: (patch) => set(patch),
     }),

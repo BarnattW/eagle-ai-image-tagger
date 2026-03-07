@@ -1,9 +1,23 @@
+import { useState, useRef } from "react";
 import { useSettingsStore } from "../store/settingsStore";
+import TagPicker from "./TagPicker";
 
 const DEFAULT_PROMPT =
-  `Look at this image and generate 10-20 descriptive tags.\n` +
-  `Cover: art style, subject, characters, clothing, colors, mood, and composition.\n` +
-  `Use concise Danbooru-style tags where applicable (e.g. "1girl", "blue hair", "smile").`;
+  `IMPORTANT: Output ONLY valid JSON. NO explanations, NO markdown, NO extra text.` +
+  `Analyze this image and generate 15-25 accurate Danbooru-style tags.\n` +
+  `Cover all of the following categories that apply:\n` +
+  `- Subject: 1girl, 1boy, multiple girls, no humans, animal, etc.\n` +
+  `- Art style: anime, manga, realistic, painterly, sketch, chibi, pixel art, etc.\n` +
+  `- Character: hair color/length/style, eye color, skin tone, facial expression\n` +
+  `- Clothing & accessories: specific garment names, colors, patterns\n` +
+  `- Pose & body: standing, sitting, lying, arms up, from behind, close-up, full body, etc.\n` +
+  `- Action: looking at viewer, holding, eating, fighting, etc.\n` +
+  `- Lighting: soft lighting, backlight, rim light, dramatic shadow, dark, bright, etc.\n` +
+  `- Colors: dominant colors, monochrome, colorful, pastel, warm tones, etc.\n` +
+  `- Background: simple background, outdoors, indoors, specific location\n` +
+  `- Composition: portrait, dutch angle, wide shot, from above, from below\n` +
+  `- Mood: happy, sad, serious, romantic, action, peaceful\n` +
+  `Be specific and accurate. Only tag what is clearly visible. Do not guess.`;
 
 const Section = ({ title, children }) => (
   <div className="mb-8">
@@ -87,11 +101,35 @@ const Toggle = ({ checked, onChange, label }) => (
 const Settings = () => {
   const {
     inferenceMode,
-    modelPath, tagsPath, thresholdGeneral, thresholdCharacter, topN,
+    wd14ModelDir, thresholdGeneral, thresholdCharacter, topN,
     clipEnabled, clipModelDir, clipThreshold, clipTopN,
     llmProvider, llmApiKey, llmModel, llmEndpoint, llmPrompt, llmIncludeLibraryTags,
+    promptPresets, autoSave, tagBlacklist,
     update,
   } = useSettingsStore();
+
+  const [blacklistInput, setBlacklistInput] = useState("");
+  const [showBlacklistPicker, setShowBlacklistPicker] = useState(false);
+  const blacklistPickerBtnRef = useRef(null);
+  const [blacklistPickerStyle, setBlacklistPickerStyle] = useState({});
+  const [newPresetName, setNewPresetName] = useState("");
+  const [addingPreset, setAddingPreset] = useState(false);
+  const [selectedPresetIdx, setSelectedPresetIdx] = useState("__default__");
+
+  const addToBlacklist = () => {
+    const tag = blacklistInput.trim().toLowerCase();
+    if (!tag || tagBlacklist.includes(tag)) return;
+    update({ tagBlacklist: [...tagBlacklist, tag] });
+    setBlacklistInput("");
+  };
+
+  const savePreset = () => {
+    if (!newPresetName.trim()) return;
+    const prompt = llmPrompt.trim() || DEFAULT_PROMPT;
+    update({ promptPresets: [...promptPresets, { name: newPresetName.trim(), prompt }] });
+    setNewPresetName("");
+    setAddingPreset(false);
+  };
 
   return (
     <div className="flex-1 overflow-y-auto p-6 custom-scrollbar [scrollbar-gutter:stable]">
@@ -99,6 +137,70 @@ const Settings = () => {
         <h2 className="text-3xl font-bold text-eagle-text">Plugin Settings</h2>
         <p className="text-eagle-text-secondary mt-1">Configure inference mode and parameters</p>
       </div>
+
+      {/* General */}
+      <Section title="General">
+        <Field label="Auto-save tags" hint="Automatically save generated tags to Eagle without clicking Save.">
+          <Toggle checked={autoSave} onChange={(v) => update({ autoSave: v })} label="Enabled" />
+        </Field>
+        <Field label="Tag blacklist" hint="Tags in this list are never added, regardless of inference mode.">
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={blacklistInput}
+              onChange={(e) => setBlacklistInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && addToBlacklist()}
+              placeholder="e.g. simple background"
+              className="flex-1 bg-eagle-btn-bg border border-eagle-border rounded-lg px-3 py-2 text-sm text-eagle-text placeholder:text-eagle-text-muted focus:outline-none focus:border-eagle-accent transition-colors"
+            />
+            <button
+              onClick={addToBlacklist}
+              className="px-3 py-2 bg-eagle-btn-bg hover:bg-eagle-btn-hover border border-eagle-border rounded-lg text-sm text-eagle-text transition-colors"
+            >
+              Add
+            </button>
+            <button
+              ref={blacklistPickerBtnRef}
+              onClick={() => {
+                const rect = blacklistPickerBtnRef.current?.getBoundingClientRect();
+                if (rect) setBlacklistPickerStyle({ top: rect.bottom + 6, right: window.innerWidth - rect.right });
+                setShowBlacklistPicker((v) => !v);
+              }}
+              title="Pick from library"
+              className="px-3 py-2 bg-eagle-btn-bg hover:bg-eagle-btn-hover border border-eagle-border rounded-lg text-sm text-eagle-text-secondary hover:text-eagle-text transition-colors leading-none"
+            >
+              ⌖
+            </button>
+          </div>
+          {showBlacklistPicker && (
+            <TagPicker
+              onSelect={(tag) => {
+                const t = tag.toLowerCase();
+                if (!tagBlacklist.includes(t)) update({ tagBlacklist: [...tagBlacklist, t] });
+                setShowBlacklistPicker(false);
+              }}
+              onClose={() => setShowBlacklistPicker(false)}
+              excludeTags={tagBlacklist}
+              style={blacklistPickerStyle}
+            />
+          )}
+          {tagBlacklist.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 mt-1">
+              {tagBlacklist.map((tag) => (
+                <span key={tag} className="flex items-center gap-1 bg-eagle-btn-bg border border-eagle-border rounded px-2 py-0.5 text-xs text-eagle-text">
+                  {tag}
+                  <button
+                    onClick={() => update({ tagBlacklist: tagBlacklist.filter((t) => t !== tag) })}
+                    className="opacity-50 hover:opacity-100 hover:text-red-400 transition-opacity leading-none"
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+        </Field>
+      </Section>
 
       {/* Mode toggle */}
       <Section title="Inference Mode">
@@ -127,11 +229,8 @@ const Settings = () => {
       {inferenceMode === "local" && (
         <>
           <Section title="Model Files">
-            <Field label="Model file (.onnx)" hint="Absolute path to your WD tagger ONNX model file.">
-              <PathInput value={modelPath} onChange={(v) => update({ modelPath: v })} placeholder="/path/to/model.onnx" filters={[{ name: "ONNX Model", extensions: ["onnx"] }]} />
-            </Field>
-            <Field label="Tags file (.csv)" hint="Absolute path to the selected_tags.csv that matches your model.">
-              <PathInput value={tagsPath} onChange={(v) => update({ tagsPath: v })} placeholder="/path/to/selected_tags.csv" filters={[{ name: "CSV", extensions: ["csv"] }]} />
+            <Field label="WD14 model folder" hint="Folder containing model.onnx and selected_tags.csv. Leave empty to use the plugin's own inference/ folder.">
+              <PathInput value={wd14ModelDir} onChange={(v) => update({ wd14ModelDir: v })} placeholder="/path/to/wd14-model-folder" mode="folder" />
             </Field>
             <div className="bg-eagle-panel border border-eagle-border rounded-lg p-3 text-xs text-eagle-text-secondary leading-relaxed">
               Download the WD SwinV2 Tagger v3 model from HuggingFace:
@@ -141,9 +240,7 @@ const Settings = () => {
               </span>
               <br />
               Download <span className="font-mono">model.onnx</span> and{" "}
-              <span className="font-mono">selected_tags.csv</span>, then set the paths above.
-              If left empty, the plugin looks for both files in its own{" "}
-              <span className="font-mono">inference/</span> folder.
+              <span className="font-mono">selected_tags.csv</span> into the same folder, then set the path above.
             </div>
           </Section>
 
@@ -283,22 +380,73 @@ const Settings = () => {
             />
           </Field>
 
-          <Field label="Prompt" hint="The instruction sent to the LLM. Leave blank to use the default.">
-            <textarea
-              value={llmPrompt}
-              onChange={(e) => update({ llmPrompt: e.target.value })}
-              placeholder={DEFAULT_PROMPT}
-              rows={5}
-              className="bg-eagle-btn-bg border border-eagle-border rounded-lg px-3 py-2 text-sm text-eagle-text placeholder:text-eagle-text-muted focus:outline-none focus:border-eagle-accent transition-colors resize-y font-mono"
-            />
-            {llmPrompt && (
-              <button
-                onClick={() => update({ llmPrompt: "" })}
-                className="text-xs text-eagle-text-muted hover:text-eagle-text w-fit"
+          <Field label="Prompt" hint="The instruction sent to the LLM with the image.">
+            <div className="flex items-center gap-2">
+              <select
+                value={selectedPresetIdx}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setSelectedPresetIdx(val);
+                  if (val === "__default__") {
+                    update({ llmPrompt: DEFAULT_PROMPT });
+                  } else {
+                    const idx = parseInt(val);
+                    if (!isNaN(idx)) update({ llmPrompt: promptPresets[idx].prompt });
+                  }
+                }}
+                className="flex-1 bg-eagle-btn-bg border border-eagle-border rounded-lg px-3 py-2 text-sm text-eagle-text focus:outline-none focus:border-eagle-accent transition-colors"
               >
-                Reset to default
-              </button>
-            )}
+                <option value="__default__">Default</option>
+                {promptPresets.map((p, i) => (
+                  <option key={i} value={String(i)}>{p.name}</option>
+                ))}
+              </select>
+
+              {!addingPreset ? (
+                <button
+                  onClick={() => setAddingPreset(true)}
+                  className="px-3 py-2 bg-eagle-btn-bg hover:bg-eagle-btn-hover border border-eagle-border rounded-lg text-sm text-eagle-text transition-colors shrink-0"
+                >
+                  Save as preset…
+                </button>
+              ) : (
+                <div className="flex items-center gap-2">
+                  <input
+                    autoFocus
+                    type="text"
+                    value={newPresetName}
+                    onChange={(e) => setNewPresetName(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") savePreset(); if (e.key === "Escape") setAddingPreset(false); }}
+                    placeholder="Preset name"
+                    className="bg-eagle-btn-bg border border-eagle-accent rounded-lg px-3 py-2 text-sm text-eagle-text focus:outline-none"
+                  />
+                  <button onClick={savePreset} className="px-3 py-2 bg-eagle-primary hover:bg-eagle-primary-hover text-white rounded-lg text-sm transition-colors">Save</button>
+                  <button onClick={() => setAddingPreset(false)} className="px-3 py-2 bg-eagle-btn-bg hover:bg-eagle-btn-hover border border-eagle-border rounded-lg text-sm text-eagle-text transition-colors">Cancel</button>
+                </div>
+              )}
+
+              {selectedPresetIdx !== "__default__" && !addingPreset && (
+                <button
+                  onClick={() => {
+                    const idx = parseInt(selectedPresetIdx);
+                    update({ promptPresets: promptPresets.filter((_, j) => j !== idx) });
+                    setSelectedPresetIdx("__default__");
+                    update({ llmPrompt: DEFAULT_PROMPT });
+                  }}
+                  className="px-3 py-2 bg-eagle-btn-bg hover:bg-red-900/40 border border-eagle-border hover:border-red-700/50 rounded-lg text-sm text-eagle-text-muted hover:text-red-400 transition-colors shrink-0"
+                  title="Delete this preset"
+                >
+                  Delete
+                </button>
+              )}
+            </div>
+
+            <textarea
+              value={llmPrompt || DEFAULT_PROMPT}
+              onChange={(e) => update({ llmPrompt: e.target.value })}
+              rows={6}
+              className="bg-eagle-btn-bg border border-eagle-border rounded-lg px-3 py-2 text-sm text-eagle-text focus:outline-none focus:border-eagle-accent transition-colors resize-y font-mono"
+            />
           </Field>
 
           <Field

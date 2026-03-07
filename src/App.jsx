@@ -11,8 +11,8 @@ import Gallery from "./Gallery";
 function syncSettingsToBridge(state) {
   window.__autoTaggerInference?.configure?.({
     inferenceMode: state.inferenceMode,
-    modelPath: state.modelPath || null,
-    tagsPath: state.tagsPath || null,
+    modelPath: state.wd14ModelDir ? `${state.wd14ModelDir}/model.onnx` : (state.modelPath || null),
+    tagsPath: state.wd14ModelDir ? `${state.wd14ModelDir}/selected_tags.csv` : (state.tagsPath || null),
     thresholdGeneral: state.thresholdGeneral,
     thresholdCharacter: state.thresholdCharacter,
     topN: state.topN,

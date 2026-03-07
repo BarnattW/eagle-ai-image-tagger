@@ -1,18 +1,23 @@
 const path = require("path");
 
-eagle.onPluginCreate(async (plugin) => {
-  console.log("eagle.onPluginCreate");
-  console.log(plugin);
+function applyTheme(theme) {
+  const t = (theme || "").toUpperCase();
+  if (!t || t === "DARK") {
+    document.documentElement.removeAttribute("data-theme");
+  } else {
+    document.documentElement.setAttribute("data-theme", t);
+  }
+}
+
+eagle.onPluginCreate(async () => {
+  const theme = await eagle.app.theme;
+  applyTheme(theme);
 });
 
+eagle.onThemeChanged((theme) => applyTheme(theme));
+
 eagle.onPluginRun(async () => {
-  console.log("eagle.onPluginRun");
-
-  const theme = await eagle.app.theme;
-  if (theme) document.documentElement.setAttribute("data-theme", theme.toUpperCase());
   const items = await eagle.item.getSelected();
-
-  // Call into React
   if (window.__autoTagger?.setSelectedItems) {
     window.__autoTagger.setSelectedItems(items);
   } else {

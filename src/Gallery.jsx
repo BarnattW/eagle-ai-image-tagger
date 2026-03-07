@@ -1,8 +1,9 @@
-import { useState, useRef, useCallback, useEffect, createContext, useContext, memo } from "react";
+import { useState, useRef, useCallback, useEffect, useMemo, createContext, useContext, memo } from "react";
 import { useMasonry, usePositioner } from "masonic";
 import { useTaggerStore } from "../store/taggerStore";
 import ImagePreview from "./ImagePreview";
 import TagPanel from "./TagPanel";
+import TagPicker from "./TagPicker";
 
 const GalleryCtx = createContext(null);
 
@@ -53,7 +54,7 @@ const CheckIcon = () => (
 );
 
 const GalleryCard = memo(({ data: item }) => {
-  const { selectedIds, onItemClick, selectMode } = useContext(GalleryCtx);
+  const { selectedIds, onItemClick, onCheckboxClick, selectMode } = useContext(GalleryCtx);
   const isSelected = selectedIds.has(item.id);
   const isUntagged = !item.tags || item.tags.length === 0;
   const ratio = item.width && item.height ? item.width / item.height : 1;
@@ -73,9 +74,12 @@ const GalleryCard = memo(({ data: item }) => {
         {isSelected && <div className="absolute inset-0 bg-eagle-accent/20 pointer-events-none" />}
 
         {/* Checkbox */}
-        <div className={`absolute top-1.5 left-1.5 transition-opacity ${
-          isSelected || selectMode ? "opacity-100" : "opacity-0 group-hover:opacity-100"
-        }`}>
+        <div
+          className={`absolute top-1.5 left-1.5 transition-opacity ${
+            isSelected || selectMode ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+          }`}
+          onClick={(e) => { e.stopPropagation(); onCheckboxClick(item); }}
+        >
           <div className={`w-5 h-5 rounded border-2 flex items-center justify-center transition-colors ${
             isSelected ? "bg-eagle-accent border-eagle-accent" : "bg-black/40 border-white/60"
           }`}>
@@ -141,42 +145,78 @@ const DivMasonry = ({ items, containerRef }) => {
     items,
     render: GalleryCard,
     overscanBy: 5,
-    itemKey: (item) => item.id,
+    itemKey: (item) => item?.id ?? String(Math.random()),
     style: { padding: 12 },
   });
 };
 
 const Gallery = () => {
-  const { allItems, loadAllItems, batchProgress, tagItems, selectItem } = useTaggerStore();
+  const { allItems, loadAllItems, batchProgress, tagItems, cancelTagItems, selectItem } = useTaggerStore();
   const [filter, setFilter] = useState("all");
+  const [tagFilters, setTagFilters] = useState([]);
+  const [tagInput, setTagInput] = useState("");
+  const [showTagPicker, setShowTagPicker] = useState(false);
+  const tagPickerBtnRef = useRef(null);
+  const [tagPickerStyle, setTagPickerStyle] = useState({});
+
+  const addTagFilter = (tag) => {
+    const t = tag.trim().toLowerCase();
+    if (t && !tagFilters.includes(t)) setTagFilters((prev) => [...prev, t]);
+    setTagInput("");
+  };
   const [viewMode, setViewMode] = useState("grid");
   const [selectedIds, setSelectedIds] = useState(new Set());
   const [selectMode, setSelectMode] = useState(false);
   const scrollRef = useRef(null);
+  const lastClickedIdxRef = useRef(null);
 
   const loaded = useRef(false);
   if (!loaded.current) { loaded.current = true; loadAllItems(); }
 
-  const filteredItems = filter === "untagged"
-    ? allItems.filter((x) => !x.tags || x.tags.length === 0)
-    : allItems;
+  const filteredItems = useMemo(() => {
+    let items = (filter === "untagged"
+      ? allItems.filter((x) => x && (!x.tags || x.tags.length === 0))
+      : allItems.filter(Boolean));
+    if (tagFilters.length > 0) {
+      items = items.filter((x) =>
+        tagFilters.every((f) => x.tags?.some((t) => t.toLowerCase().includes(f)))
+      );
+    }
+    return items;
+  }, [allItems, filter, tagFilters]);
 
   const untaggedCount = allItems.filter((x) => !x.tags || x.tags.length === 0).length;
 
   const handleItemClick = useCallback((item, e) => {
     if (batchProgress) return;
-    if (selectMode || e.ctrlKey || e.metaKey) {
+    const idx = filteredItems.findIndex((x) => x.id === item.id);
+
+    if (e.shiftKey && lastClickedIdxRef.current !== null) {
+      e.stopPropagation();
+      const [start, end] = [
+        Math.min(lastClickedIdxRef.current, idx),
+        Math.max(lastClickedIdxRef.current, idx),
+      ];
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        for (let i = start; i <= end; i++) next.add(filteredItems[i].id);
+        return next;
+      });
+      lastClickedIdxRef.current = idx;
+    } else if (selectMode || e.ctrlKey || e.metaKey) {
       e.stopPropagation();
       setSelectedIds((prev) => {
         const next = new Set(prev);
         next.has(item.id) ? next.delete(item.id) : next.add(item.id);
         return next;
       });
+      lastClickedIdxRef.current = idx;
     } else {
       selectItem(item);
       setViewMode("detail");
+      lastClickedIdxRef.current = null;
     }
-  }, [batchProgress, selectItem, selectMode]);
+  }, [batchProgress, selectItem, selectMode, filteredItems]);
 
   const toggleSelectMode = () => {
     setSelectMode((v) => {
@@ -191,7 +231,18 @@ const Gallery = () => {
     setSelectMode(false);
   };
 
-  const ctxValue = { selectedIds, onItemClick: handleItemClick, selectMode };
+  const handleCheckboxClick = useCallback((item) => {
+    if (batchProgress) return;
+    const idx = filteredItems.findIndex((x) => x.id === item.id);
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      next.has(item.id) ? next.delete(item.id) : next.add(item.id);
+      return next;
+    });
+    lastClickedIdxRef.current = idx;
+  }, [batchProgress, filteredItems]);
+
+  const ctxValue = { selectedIds, onItemClick: handleItemClick, onCheckboxClick: handleCheckboxClick, selectMode };
 
   if (viewMode === "detail") {
     return (
@@ -235,6 +286,38 @@ const Gallery = () => {
           </button>
         </div>
 
+        <div className="flex items-center gap-1 flex-wrap">
+          <input
+            type="text"
+            value={tagInput}
+            onChange={(e) => setTagInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter" && tagInput.trim()) addTagFilter(tagInput); }}
+            placeholder="Filter by tag…"
+            className="px-3 py-1.5 text-sm bg-eagle-btn-bg border border-eagle-border rounded-lg text-eagle-text placeholder:text-eagle-text-muted focus:outline-none focus:border-eagle-accent transition-colors w-36"
+          />
+          <button
+            ref={tagPickerBtnRef}
+            onClick={() => {
+              const rect = tagPickerBtnRef.current?.getBoundingClientRect();
+              if (rect) setTagPickerStyle({ top: rect.bottom + 6, left: rect.left });
+              setShowTagPicker((v) => !v);
+            }}
+            title="Pick tag from library"
+            className="px-2 py-1.5 bg-eagle-btn-bg hover:bg-eagle-btn-hover border border-eagle-border rounded-lg text-eagle-text-secondary hover:text-eagle-text transition-colors text-sm leading-none"
+          >
+            ⌖
+          </button>
+          {tagFilters.map((f) => (
+            <span key={f} className="flex items-center gap-1 bg-eagle-accent/20 border border-eagle-accent/40 rounded px-2 py-0.5 text-xs text-eagle-text">
+              {f}
+              <button onClick={() => setTagFilters((prev) => prev.filter((t) => t !== f))} className="opacity-60 hover:opacity-100 leading-none">×</button>
+            </span>
+          ))}
+          {tagFilters.length > 0 && (
+            <button onClick={() => setTagFilters([])} className="text-xs text-eagle-text-muted hover:text-eagle-text transition-colors" title="Clear all filters">Clear</button>
+          )}
+        </div>
+
         <button
           onClick={toggleSelectMode}
           className={`px-3 py-1.5 text-sm rounded-lg border transition-colors ${
@@ -275,6 +358,12 @@ const Gallery = () => {
             <span className="text-xs text-eagle-text-secondary tabular-nums">
               {batchProgress.current}/{batchProgress.total}
             </span>
+            <button
+              onClick={cancelTagItems}
+              className="px-2 py-1 text-xs bg-eagle-btn-bg hover:bg-eagle-btn-hover border border-eagle-border text-eagle-text-secondary hover:text-eagle-text rounded transition-colors"
+            >
+              Cancel
+            </button>
           </div>
         )}
       </div>
@@ -294,6 +383,15 @@ const Gallery = () => {
             <DivMasonry items={filteredItems} containerRef={scrollRef} />
           </div>
         </GalleryCtx.Provider>
+      )}
+
+      {showTagPicker && (
+        <TagPicker
+          onSelect={(tag) => { addTagFilter(tag); setShowTagPicker(false); }}
+          excludeTags={tagFilters}
+          onClose={() => setShowTagPicker(false)}
+          style={tagPickerStyle}
+        />
       )}
     </div>
   );

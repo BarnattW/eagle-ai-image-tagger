@@ -7,7 +7,7 @@ const tabs = [
 const Sidebar = ({ activeSection, onTabChange }) => (
   <nav className="bg-eagle-elevated border-r border-eagle-border flex-col py-4 hidden md:flex">
     <h1 className="px-4 text-xl font-bold text-eagle-accent mb-4">
-      Auto-Tagger
+      AI Image Tagger
     </h1>
     <ul className="flex-1 space-y-1">
       {tabs.map(({ name, id }) => (

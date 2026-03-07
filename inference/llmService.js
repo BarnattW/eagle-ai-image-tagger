@@ -2,6 +2,7 @@ const fs = require("fs");
 const path = require("path");
 
 const DEFAULT_PROMPT =
+  `IMPORTANT: Output ONLY valid JSON. NO explanations, NO markdown, NO extra text.` +
   `Analyze this image and generate 15-25 accurate Danbooru-style tags.\n` +
   `Cover all of the following categories that apply:\n` +
   `- Subject: 1girl, 1boy, multiple girls, no humans, animal, etc.\n` +
@@ -63,10 +64,12 @@ function buildPrompt(userTags) {
       `From this list of my existing tags: ${tagList}\n` +
       `Select ONLY tags that are a direct, confident match to something clearly visible in this image.\n` +
       `Rules: do not include a library tag unless you are certain it applies. Prefer no matches over wrong matches.\n\n` +
-      `Return JSON: {"tags": ["tag1", ...], "library": ["tag1", ...]}`
+      `Return ONLY JSON. No explanations, no markdown, no extra text.
+      Output exactly in this format:
+    {"tags": ["tag1", ...], "library": ["tag1", ...]}`
     );
   }
-  return `${base}\n\nReturn only a JSON array: ["tag1", "tag2", ...]`;
+  return `${base}\n\nReturn ONLY a JSON array (No explanations, no markdown, no extra text) in this format: ["tag1", "tag2", ...]`;
 }
 
 async function callOpenAI(
@@ -76,37 +79,52 @@ async function callOpenAI(
   model,
   apiKey,
   baseUrl = "https://api.openai.com/v1",
+  isLocal = false,
 ) {
   const url = `${baseUrl.replace(/\/$/, "")}/chat/completions`;
   console.log("Making OpenAI request to url:", url);
   const headers = { "Content-Type": "application/json" };
   if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+
+  // Local models (e.g. Qwen3 reasoning) need a system message to suppress chain-of-thought
+  // and a much higher token budget so reasoning + JSON both fit.
+  const messages = [];
+  if (isLocal) {
+    messages.push({
+      role: "system",
+      content: "You are a concise image tagging assistant. Output ONLY valid JSON. No thinking, no reasoning steps, no explanations.",
+    });
+  }
+  messages.push({
+    role: "user",
+    content: [
+      {
+        type: "image_url",
+        image_url: {
+          url: `data:${mimeType};base64,${base64Image}`,
+          detail: "low",
+        },
+      },
+      { type: "text", text: prompt },
+    ],
+  });
+
   const response = await fetch(url, {
     method: "POST",
     headers,
     body: JSON.stringify({
       model: model || DEFAULT_MODELS.openai,
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "image_url",
-              image_url: {
-                url: `data:${mimeType};base64,${base64Image}`,
-                detail: "low",
-              },
-            },
-            { type: "text", text: prompt },
-          ],
-        },
-      ],
-      max_tokens: 512,
+      messages,
+      max_tokens: isLocal ? 8192 : 1024,
+      // Hint for LM Studio / llama.cpp to disable thinking mode
+      chat_template_kwargs: { enable_thinking: false },
     }),
   });
   if (!response.ok)
     throw new Error(`OpenAI ${response.status}: ${await response.text()}`);
-  return (await response.json()).choices[0].message.content;
+  const msg = (await response.json()).choices[0].message;
+  // Strip <think>...</think> blocks emitted by reasoning models
+  return (msg.content ?? "").replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
 }
 
 async function callAnthropic(base64Image, mimeType, prompt, model, apiKey) {
@@ -172,14 +190,16 @@ function parseTags(rawText, hasLibrary) {
   }
 }
 
-async function llmGenerateTags(imagePath, userTags = []) {
+async function llmGenerateTags(imagePath, userTags = [], thumbnailPath = null) {
   const isLocal = llmConfig.provider === "local";
   if (!llmConfig.enabled || (!isLocal && !llmConfig.apiKey) || !imagePath)
     return { tags: [], library: [] };
 
   try {
-    const base64Image = imageToBase64(imagePath);
-    const mimeType = getMimeType(imagePath);
+    // Local vision models have limited KV cache; thumbnails use far fewer tokens
+    const resolvedPath = (isLocal && thumbnailPath) ? thumbnailPath : imagePath;
+    const base64Image = imageToBase64(resolvedPath);
+    const mimeType = getMimeType(resolvedPath);
     const hasLibrary = llmConfig.includeLibraryTags && userTags.length > 0;
     const prompt = buildPrompt(hasLibrary ? userTags : null);
     const model =
@@ -203,6 +223,7 @@ async function llmGenerateTags(imagePath, userTags = []) {
             model,
             llmConfig.apiKey,
             isLocal ? llmConfig.endpoint : undefined,
+            isLocal,
           );
 
     const { tags, library } = parseTags(rawText, hasLibrary);

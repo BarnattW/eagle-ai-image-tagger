@@ -31,6 +31,7 @@ export const useTaggerStore = create((set, get) => ({
   userTags: [],
   allItems: [],
   batchProgress: null, // { current, total } | null
+  batchCancelled: false,
 
   setItems: (newItems) => {
     const arr = newItems || [];
@@ -43,19 +44,28 @@ export const useTaggerStore = create((set, get) => ({
 
   selectItem: async (item) => {
     set({ selectedItem: item, isGenerating: true, autoTags: [], clipTags: [], inferenceError: null, clipWarning: null });
-    const { inferenceMode, clipEnabled } = useSettingsStore.getState();
+    const { inferenceMode, clipEnabled, tagBlacklist, autoSave } = useSettingsStore.getState();
+    const blacklist = new Set((tagBlacklist || []).map((t) => t.toLowerCase()));
+    const existing = item.tags || [];
+    const cleanTags = (tags) =>
+      dedupeTags(
+        Array.isArray(tags) ? tags.filter((t) => !blacklist.has(t.toLowerCase())) : [],
+        existing
+      );
 
     try {
       if (inferenceMode === "llm") {
         const userTags = get().userTags.map((t) => (typeof t === "string" ? t : t.name));
-        const { tags, library } = await llmGenerateTags(item.filePath, userTags);
+        const { tags, library } = await llmGenerateTags(item.filePath, userTags, item.thumbnailPath);
         if (get().selectedItem?.id !== item.id) return;
-        set({ autoTags: tags, clipTags: library });
+        set({ autoTags: cleanTags(tags), clipTags: cleanTags(library) });
+        if (autoSave && get().autoTags.length > 0) await get().saveTags();
       } else {
         // Local: WD14 first, show immediately, then CLIP in background
         const genTags = await runTaggerLatest(item.filePath);
         if (get().selectedItem?.id !== item.id) return;
-        set({ autoTags: Array.isArray(genTags) ? genTags : [], isGenerating: false });
+        set({ autoTags: cleanTags(genTags), isGenerating: false });
+        if (autoSave && get().autoTags.length > 0) await get().saveTags();
 
         if (clipEnabled) {
           try {
@@ -66,7 +76,7 @@ export const useTaggerStore = create((set, get) => ({
               Array.isArray(genTags) ? genTags : []
             );
             if (get().selectedItem?.id !== item.id) return;
-            set({ clipTags: Array.isArray(suggested) ? suggested : [] });
+            set({ clipTags: cleanTags(suggested) });
           } catch (clipErr) {
             if (get().selectedItem?.id === item.id)
               set({ clipWarning: humanizeError(clipErr) });
@@ -112,16 +122,22 @@ export const useTaggerStore = create((set, get) => ({
     }
   },
 
+  cancelTagItems: () => set({ batchCancelled: true }),
+
   tagItems: async (items) => {
     if (!items.length) return;
-    set({ batchProgress: { current: 0, total: items.length } });
+    set({ batchProgress: { current: 0, total: items.length }, batchCancelled: false });
+    const { tagBlacklist } = useSettingsStore.getState();
+    const blacklist = new Set((tagBlacklist || []).map((t) => t.toLowerCase()));
 
     for (let i = 0; i < items.length; i++) {
+      if (get().batchCancelled) break;
       const item = items[i];
       try {
         const genTags = await runTaggerLatest(item.filePath);
-        if (genTags && genTags.length) {
-          const tags = dedupeTags(genTags, item.tags);
+        const filtered = (genTags || []).filter((t) => !blacklist.has(t.toLowerCase()));
+        if (filtered.length) {
+          const tags = dedupeTags(filtered, item.tags);
           if (tags.length) {
             await saveTagsToItem(item, tags);
             set((state) => ({
@@ -137,7 +153,7 @@ export const useTaggerStore = create((set, get) => ({
       set({ batchProgress: { current: i + 1, total: items.length } });
     }
 
-    set({ batchProgress: null });
+    set({ batchProgress: null, batchCancelled: false });
   },
 
   saveTags: async () => {
