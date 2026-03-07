@@ -1,12 +1,10 @@
 import { create } from "zustand";
-import { dedupeTags, runTaggerLatest, clipSuggestTags, llmGenerateTags } from "../js/taggerService";
+import { dedupeTags, llmGenerateTags } from "../js/taggerService";
 import { fetchUserTags, saveTagsToItem } from "../js/eagleService";
 import { useSettingsStore } from "./settingsStore";
 
 function humanizeError(err) {
   const msg = err?.message || String(err);
-  if (msg.includes("ENOENT") || msg.includes("no such file"))
-    return "Model file not found. Check the paths in Settings.";
   if (msg.includes("ERR_CONNECTION_REFUSED") || msg.includes("Failed to fetch"))
     return "Could not connect to the LLM server. Is it running?";
   if (msg.includes("401") || msg.includes("Unauthorized"))
@@ -27,7 +25,6 @@ export const useTaggerStore = create((set, get) => ({
   clipTags: [],
   isGenerating: false,
   inferenceError: null,
-  clipWarning: null,
   userTags: [],
   allItems: [],
   batchProgress: null, // { current, total } | null
@@ -43,8 +40,8 @@ export const useTaggerStore = create((set, get) => ({
   },
 
   selectItem: async (item) => {
-    set({ selectedItem: item, isGenerating: true, autoTags: [], clipTags: [], inferenceError: null, clipWarning: null });
-    const { inferenceMode, clipEnabled, tagBlacklist, autoSave } = useSettingsStore.getState();
+    set({ selectedItem: item, isGenerating: true, autoTags: [], clipTags: [], inferenceError: null });
+    const { tagBlacklist, autoSave } = useSettingsStore.getState();
     const blacklist = new Set((tagBlacklist || []).map((t) => t.toLowerCase()));
     const existing = item.tags || [];
     const cleanTags = (tags) =>
@@ -54,35 +51,11 @@ export const useTaggerStore = create((set, get) => ({
       );
 
     try {
-      if (inferenceMode === "llm") {
-        const userTags = get().userTags.map((t) => (typeof t === "string" ? t : t.name));
-        const { tags, library } = await llmGenerateTags(item.filePath, userTags, item.thumbnailPath);
-        if (get().selectedItem?.id !== item.id) return;
-        set({ autoTags: cleanTags(tags), clipTags: cleanTags(library) });
-        if (autoSave && get().autoTags.length > 0) await get().saveTags();
-      } else {
-        // Local: WD14 first, show immediately, then CLIP in background
-        const genTags = await runTaggerLatest(item.filePath);
-        if (get().selectedItem?.id !== item.id) return;
-        set({ autoTags: cleanTags(genTags), isGenerating: false });
-        if (autoSave && get().autoTags.length > 0) await get().saveTags();
-
-        if (clipEnabled) {
-          try {
-            const userTags = get().userTags.map((t) => (typeof t === "string" ? t : t.name));
-            const suggested = await clipSuggestTags(
-              item.filePath,
-              userTags,
-              Array.isArray(genTags) ? genTags : []
-            );
-            if (get().selectedItem?.id !== item.id) return;
-            set({ clipTags: cleanTags(suggested) });
-          } catch (clipErr) {
-            if (get().selectedItem?.id === item.id)
-              set({ clipWarning: humanizeError(clipErr) });
-          }
-        }
-      }
+      const userTags = get().userTags.map((t) => (typeof t === "string" ? t : t.name));
+      const { tags, library } = await llmGenerateTags(item.filePath, userTags, item.thumbnailPath);
+      if (get().selectedItem?.id !== item.id) return;
+      set({ autoTags: cleanTags(tags), clipTags: cleanTags(library) });
+      if (autoSave && get().autoTags.length > 0) await get().saveTags();
     } catch (err) {
       console.error(err);
       if (get().selectedItem?.id === item.id)
@@ -129,20 +102,22 @@ export const useTaggerStore = create((set, get) => ({
     set({ batchProgress: { current: 0, total: items.length }, batchCancelled: false });
     const { tagBlacklist } = useSettingsStore.getState();
     const blacklist = new Set((tagBlacklist || []).map((t) => t.toLowerCase()));
+    const userTags = get().userTags.map((t) => (typeof t === "string" ? t : t.name));
 
     for (let i = 0; i < items.length; i++) {
       if (get().batchCancelled) break;
       const item = items[i];
       try {
-        const genTags = await runTaggerLatest(item.filePath);
-        const filtered = (genTags || []).filter((t) => !blacklist.has(t.toLowerCase()));
+        const { tags, library } = await llmGenerateTags(item.filePath, userTags, item.thumbnailPath);
+        const allTags = [...(tags || []), ...(library || [])];
+        const filtered = allTags.filter((t) => !blacklist.has(t.toLowerCase()));
         if (filtered.length) {
-          const tags = dedupeTags(filtered, item.tags);
-          if (tags.length) {
-            await saveTagsToItem(item, tags);
+          const newTags = dedupeTags(filtered, item.tags);
+          if (newTags.length) {
+            await saveTagsToItem(item, newTags);
             set((state) => ({
               allItems: state.allItems.map((x) =>
-                x.id === item.id ? { ...x, tags: [...x.tags, ...tags] } : x
+                x.id === item.id ? { ...x, tags: [...x.tags, ...newTags] } : x
               ),
             }));
           }

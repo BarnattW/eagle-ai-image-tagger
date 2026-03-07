@@ -1,6 +1,5 @@
 import { useState, useRef } from "react";
 import { useTaggerStore } from "../store/taggerStore";
-import { useSettingsStore } from "../store/settingsStore";
 import TagPicker from "./TagPicker";
 
 const TagPanel = () => {
@@ -9,14 +8,12 @@ const TagPanel = () => {
     clipTags,
     isGenerating,
     inferenceError,
-    clipWarning,
     selectItem,
     selectedItem,
     removeAutoTag,
     addAutoTag,
     saveTags,
   } = useTaggerStore();
-  const { inferenceMode } = useSettingsStore();
 
   const [showPicker, setShowPicker] = useState(false);
   const [pickerStyle, setPickerStyle] = useState({});
@@ -68,11 +65,6 @@ const TagPanel = () => {
             {inferenceError}
           </div>
         )}
-        {clipWarning && !isGenerating && (
-          <div className="w-full bg-yellow-900/30 border border-yellow-700/50 rounded-lg px-3 py-2 text-sm text-yellow-300">
-            Library suggestions: {clipWarning}
-          </div>
-        )}
 
         {isGenerating ? (
           <div className="flex flex-col items-center justify-center gap-4 text-eagle-text-secondary w-full mt-4">
@@ -83,9 +75,7 @@ const TagPanel = () => {
           <>
             {clipTags.length > 0 && (
               <>
-                <h2 className="w-full text-xl font-bold">
-                  {inferenceMode === "llm" ? "Library Matches" : "Library Suggestions"}
-                </h2>
+                <h2 className="w-full text-xl font-bold">Library Matches</h2>
                 {clipTags.map((tag) => {
                   const alreadySaved = selectedItem?.tags?.includes(tag);
                   const inGenerated = autoTags.includes(tag);

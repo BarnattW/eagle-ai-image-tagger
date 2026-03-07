@@ -4,23 +4,6 @@ import { persist } from "zustand/middleware";
 export const useSettingsStore = create(
   persist(
     (set) => ({
-      // --- Inference mode ---
-      inferenceMode: "local", // "local" | "llm"
-
-      // --- Local mode: WD14 ---
-      wd14ModelDir: "", // folder containing model.onnx + selected_tags.csv
-      modelPath: "",    // legacy: explicit file paths (used if wd14ModelDir is empty)
-      tagsPath: "",
-      thresholdGeneral: 0.6,
-      thresholdCharacter: 0.9,
-      topN: 15,
-
-      // --- Local mode: CLIP library suggestions ---
-      clipEnabled: false,
-      clipModelDir: "",
-      clipThreshold: 0.2,
-      clipTopN: 10,
-
       // --- LLM mode ---
       llmProvider: "openai", // "openai" | "anthropic" | "local"
       llmApiKey: "",
