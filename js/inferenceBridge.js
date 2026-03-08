@@ -9,6 +9,7 @@ function configure(opts) {
     endpoint: opts.llmEndpoint,
     prompt: opts.llmPrompt,
     includeLibraryTags: opts.llmIncludeLibraryTags,
+    libraryPrompt: opts.llmLibraryPrompt,
   });
 }
 

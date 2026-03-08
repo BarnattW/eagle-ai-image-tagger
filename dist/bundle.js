@@ -7256,19 +7256,29 @@ const useSettingsStore = create(
       llmProvider: "openai",
       // "openai" | "anthropic" | "local"
       llmApiKey: "",
-      llmModel: "",
-      // empty = use provider default
+      llmModelOpenAI: "",
+      // empty = use provider default (gpt-4o-mini)
+      llmModelAnthropic: "",
+      // empty = use provider default (claude-haiku-4-5)
+      llmModelLocal: "",
+      // empty = use whatever the local server has loaded
       llmEndpoint: "http://localhost:1234/v1",
       // used when provider = "local"
       llmPrompt: "",
       // empty = use built-in default
       llmIncludeLibraryTags: true,
+      llmLibraryPrompt: "",
+      // empty = use built-in default
       promptPresets: [],
       // [{ name: string, prompt: string }]
       // --- General ---
       autoSave: false,
+      generateOnSelect: true,
+      // run LLM automatically when an image is selected
       tagBlacklist: [],
       // string[]
+      pinnedControls: [],
+      // string[] — filter control names pinned to the gallery top bar
       update: (patch) => set(patch)
     }),
     { name: "auto-tagger-settings" }
@@ -7288,6 +7298,39 @@ function humanizeError(err) {
     return "Plugin not fully loaded. Try reloading Eagle.";
   return msg;
 }
+let activeAbortController = null;
+let debounceTimer = null;
+async function runGeneration(item, signal, get, set) {
+  const { tagBlacklist, autoSave } = useSettingsStore.getState();
+  const blacklist = new Set((tagBlacklist || []).map((t) => t.toLowerCase()));
+  const existing = item.tags || [];
+  const cleanTags = (tags) => dedupeTags(
+    Array.isArray(tags) ? tags.filter((t) => !blacklist.has(t.toLowerCase())) : [],
+    existing
+  );
+  set({ isGenerating: true });
+  try {
+    const userTags = get().userTags.map((t) => typeof t === "string" ? t : t.name);
+    const { tags, library } = await llmGenerateTags(item.filePath, userTags, item.thumbnailPath, signal);
+    if (signal.aborted || get().selectedItem?.id !== item.id) return;
+    set({ autoTags: cleanTags(tags), clipTags: cleanTags(library) });
+    if (autoSave && get().autoTags.length > 0) await get().saveTags();
+  } catch (err) {
+    if (err.name === "AbortError") return;
+    console.error(err);
+    if (get().selectedItem?.id === item.id)
+      set({ autoTags: [], clipTags: [], inferenceError: humanizeError(err) });
+  } finally {
+    if (!signal.aborted && get().selectedItem?.id === item.id) set({ isGenerating: false });
+  }
+}
+function commitItem(set, item, extra = {}) {
+  set((state) => ({
+    tagVersion: state.tagVersion + 1,
+    allItems: state.allItems.map((x) => x.id === item.id ? item : x),
+    ...extra
+  }));
+}
 const useTaggerStore = create((set, get) => ({
   items: [],
   selectedItem: null,
@@ -7300,6 +7343,8 @@ const useTaggerStore = create((set, get) => ({
   batchProgress: null,
   // { current, total } | null
   batchCancelled: false,
+  tagVersion: 0,
+  // incremented on save/clear to force re-renders without replacing the Eagle item object
   setItems: (newItems) => {
     const arr = newItems || [];
     set({ items: arr });
@@ -7308,28 +7353,28 @@ const useTaggerStore = create((set, get) => ({
       if (arr[0]) get().selectItem(arr[0]);
     }
   },
-  selectItem: async (item) => {
-    set({ selectedItem: item, isGenerating: true, autoTags: [], clipTags: [], inferenceError: null });
-    const { tagBlacklist, autoSave } = useSettingsStore.getState();
-    const blacklist = new Set((tagBlacklist || []).map((t) => t.toLowerCase()));
-    const existing = item.tags || [];
-    const cleanTags = (tags) => dedupeTags(
-      Array.isArray(tags) ? tags.filter((t) => !blacklist.has(t.toLowerCase())) : [],
-      existing
-    );
-    try {
-      const userTags = get().userTags.map((t) => typeof t === "string" ? t : t.name);
-      const { tags, library } = await llmGenerateTags(item.filePath, userTags, item.thumbnailPath);
+  selectItem: (item) => {
+    if (activeAbortController) activeAbortController.abort();
+    clearTimeout(debounceTimer);
+    set({ selectedItem: item, autoTags: [], clipTags: [], isGenerating: false, inferenceError: null });
+    const { generateOnSelect } = useSettingsStore.getState();
+    if (!generateOnSelect) return;
+    debounceTimer = setTimeout(() => {
       if (get().selectedItem?.id !== item.id) return;
-      set({ autoTags: cleanTags(tags), clipTags: cleanTags(library) });
-      if (autoSave && get().autoTags.length > 0) await get().saveTags();
-    } catch (err) {
-      console.error(err);
-      if (get().selectedItem?.id === item.id)
-        set({ autoTags: [], clipTags: [], inferenceError: humanizeError(err) });
-    } finally {
-      if (get().selectedItem?.id === item.id) set({ isGenerating: false });
-    }
+      activeAbortController = new AbortController();
+      runGeneration(item, activeAbortController.signal, get, set);
+    }, 400);
+  },
+  // Explicitly trigger generation for the current item, ignoring generateOnSelect.
+  // Used by the Generate / Regenerate button so it always works regardless of that setting.
+  generateItem: () => {
+    const { selectedItem } = get();
+    if (!selectedItem) return;
+    if (activeAbortController) activeAbortController.abort();
+    clearTimeout(debounceTimer);
+    set({ autoTags: [], clipTags: [], isGenerating: false, inferenceError: null });
+    activeAbortController = new AbortController();
+    runGeneration(selectedItem, activeAbortController.signal, get, set);
   },
   loadUserTags: async () => {
     try {
@@ -7340,6 +7385,7 @@ const useTaggerStore = create((set, get) => ({
       set({ userTags: [] });
     }
   },
+  clearTags: () => set({ autoTags: [], clipTags: [] }),
   addAutoTag: (tag) => set((state) => ({
     autoTags: [.../* @__PURE__ */ new Set([...state.autoTags, tag])]
   })),
@@ -7361,13 +7407,12 @@ const useTaggerStore = create((set, get) => ({
     set({ batchProgress: { current: 0, total: items.length }, batchCancelled: false });
     const { tagBlacklist } = useSettingsStore.getState();
     const blacklist = new Set((tagBlacklist || []).map((t) => t.toLowerCase()));
-    const userTags = get().userTags.map((t) => typeof t === "string" ? t : t.name);
     for (let i = 0; i < items.length; i++) {
       if (get().batchCancelled) break;
       const item = items[i];
       try {
-        const { tags, library } = await llmGenerateTags(item.filePath, userTags, item.thumbnailPath);
-        const allTags = [...tags || [], ...library || []];
+        const { tags } = await llmGenerateTags(item.filePath, [], item.thumbnailPath);
+        const allTags = tags || [];
         const filtered = allTags.filter((t) => !blacklist.has(t.toLowerCase()));
         if (filtered.length) {
           const newTags = dedupeTags(filtered, item.tags);
@@ -7387,16 +7432,26 @@ const useTaggerStore = create((set, get) => ({
     }
     set({ batchProgress: null, batchCancelled: false });
   },
+  removeItemTag: async (tag) => {
+    const { selectedItem } = get();
+    if (!selectedItem) return;
+    selectedItem.tags = selectedItem.tags.filter((t) => t !== tag);
+    await selectedItem.save();
+    commitItem(set, selectedItem);
+  },
+  clearItemTags: async () => {
+    const { selectedItem } = get();
+    if (!selectedItem) return;
+    selectedItem.tags = [];
+    await selectedItem.save();
+    commitItem(set, selectedItem, { autoTags: [], clipTags: [] });
+  },
   saveTags: async () => {
     const { selectedItem, autoTags } = get();
     if (!selectedItem || autoTags.length === 0) return;
     const newTags = dedupeTags(autoTags, selectedItem.tags);
     await saveTagsToItem(selectedItem, newTags);
-    set({
-      autoTags: [],
-      clipTags: [],
-      selectedItem: { ...selectedItem, tags: [...selectedItem.tags, ...newTags] }
-    });
+    commitItem(set, selectedItem, { autoTags: [], clipTags: [] });
   }
 }));
 const ThumbnailScroller = () => {
@@ -7442,8 +7497,9 @@ const ImagePreview = () => {
   ] });
 };
 const SearchIcon = () => /* @__PURE__ */ jsxRuntimeExports.jsx("svg", { className: "w-3.5 h-3.5 text-eagle-text-muted flex-shrink-0", fill: "none", stroke: "currentColor", viewBox: "0 0 24 24", children: /* @__PURE__ */ jsxRuntimeExports.jsx("path", { strokeLinecap: "round", strokeLinejoin: "round", strokeWidth: 2, d: "M21 21l-4.35-4.35M17 11A6 6 0 1 1 5 11a6 6 0 0 1 12 0z" }) });
-const TagPicker = ({ onSelect, onClose, excludeTags = [], style }) => {
+const TagPicker = ({ onSelect, onMultiSelect, onClose, excludeTags = [], style, multi = false }) => {
   const [search, setSearch] = reactExports.useState("");
+  const [pending, setPending] = reactExports.useState(/* @__PURE__ */ new Set());
   const userTags = useTaggerStore((state) => state.userTags);
   const inputRef = reactExports.useRef(null);
   reactExports.useEffect(() => {
@@ -7454,24 +7510,46 @@ const TagPicker = ({ onSelect, onClose, excludeTags = [], style }) => {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
-  const excludeSet = new Set(excludeTags.map((t) => t.toLowerCase()));
-  const filtered = userTags.filter((tag) => {
-    const name = typeof tag === "string" ? tag : tag.name;
-    return !excludeSet.has(name.toLowerCase()) && name.toLowerCase().includes(search.toLowerCase());
-  });
+  const excludeSet = reactExports.useMemo(
+    () => new Set(excludeTags.map((t) => t.toLowerCase())),
+    [excludeTags]
+  );
+  const filtered = reactExports.useMemo(() => {
+    const q = search.toLowerCase();
+    return userTags.filter((tag) => {
+      const name = typeof tag === "string" ? tag : tag.name;
+      return !excludeSet.has(name.toLowerCase()) && name.toLowerCase().includes(q);
+    });
+  }, [userTags, excludeSet, search]);
   const recent = filtered.slice(0, 12);
   const others = filtered.slice(12);
+  const handleClick = (name) => {
+    if (!multi) {
+      onSelect(name);
+      return;
+    }
+    setPending((prev) => {
+      const next = new Set(prev);
+      next.has(name) ? next.delete(name) : next.add(name);
+      return next;
+    });
+  };
+  const applyPending = () => {
+    if (pending.size > 0) onMultiSelect?.([...pending]);
+    onClose();
+  };
   const renderGroup = (tags) => /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "grid grid-cols-2 gap-0.5", children: tags.map((tag) => {
     const name = typeof tag === "string" ? tag : tag.name;
     const count = typeof tag === "object" && tag.count != null ? tag.count : null;
     const color = typeof tag === "object" && tag.color ? tag.color : null;
+    const isSelected = multi && pending.has(name);
     return /* @__PURE__ */ jsxRuntimeExports.jsxs(
       "button",
       {
-        onClick: () => onSelect(name),
-        className: "flex items-center gap-1.5 px-2 py-1.5 rounded-md hover:bg-eagle-btn-hover text-left transition-colors min-w-0 group",
+        onClick: () => handleClick(name),
+        className: `flex items-center gap-1.5 px-2 py-1.5 rounded-md text-left transition-colors min-w-0 group ${isSelected ? "bg-eagle-accent/20" : "hover:bg-eagle-btn-hover"}`,
         children: [
-          /* @__PURE__ */ jsxRuntimeExports.jsx(
+          multi ? /* @__PURE__ */ jsxRuntimeExports.jsx("span", { className: `w-3.5 h-3.5 rounded border-2 flex items-center justify-center flex-shrink-0 transition-colors ${isSelected ? "bg-eagle-accent border-eagle-accent" : "border-eagle-border"}`, children: isSelected && /* @__PURE__ */ jsxRuntimeExports.jsx("svg", { className: "w-2 h-2 text-white", viewBox: "0 0 12 12", fill: "none", stroke: "currentColor", strokeWidth: 2.5, children: /* @__PURE__ */ jsxRuntimeExports.jsx("polyline", { points: "2,6 5,9 10,3" }) }) }) : /* @__PURE__ */ jsxRuntimeExports.jsx(
             "span",
             {
               className: "w-2 h-2 rounded-full flex-shrink-0",
@@ -7490,7 +7568,7 @@ const TagPicker = ({ onSelect, onClose, excludeTags = [], style }) => {
     );
   }) });
   return /* @__PURE__ */ jsxRuntimeExports.jsxs(jsxRuntimeExports.Fragment, { children: [
-    /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "fixed inset-0 z-40", onClick: onClose }),
+    /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "fixed inset-0 z-40", onClick: multi ? applyPending : onClose }),
     /* @__PURE__ */ jsxRuntimeExports.jsxs(
       "div",
       {
@@ -7508,7 +7586,11 @@ const TagPicker = ({ onSelect, onClose, excludeTags = [], style }) => {
                 placeholder: "Search...",
                 className: "flex-1 bg-transparent text-sm text-eagle-text placeholder:text-eagle-text-muted outline-none"
               }
-            )
+            ),
+            multi && pending.size > 0 && /* @__PURE__ */ jsxRuntimeExports.jsxs("span", { className: "text-xs text-eagle-accent font-medium tabular-nums", children: [
+              pending.size,
+              " selected"
+            ] })
           ] }),
           /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "overflow-y-auto max-h-64 custom-scrollbar [scrollbar-gutter:stable]", children: filtered.length === 0 ? /* @__PURE__ */ jsxRuntimeExports.jsx("p", { className: "text-center text-eagle-text-muted text-xs py-6", children: userTags.length === 0 ? "No tags in library" : "No matching tags" }) : /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "p-1.5 flex flex-col gap-2", children: [
             recent.length > 0 && /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { children: [
@@ -7528,7 +7610,21 @@ const TagPicker = ({ onSelect, onClose, excludeTags = [], style }) => {
               renderGroup(others)
             ] })
           ] }) }),
-          /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "border-t border-eagle-border px-3 py-1.5 flex items-center gap-4 text-eagle-text-muted text-xs select-none" })
+          /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "border-t border-eagle-border px-3 py-1.5 flex items-center gap-2 text-xs select-none", children: multi ? /* @__PURE__ */ jsxRuntimeExports.jsxs(jsxRuntimeExports.Fragment, { children: [
+            /* @__PURE__ */ jsxRuntimeExports.jsx("button", { onClick: onClose, className: "text-eagle-text-muted hover:text-eagle-text transition-colors", children: "Cancel" }),
+            /* @__PURE__ */ jsxRuntimeExports.jsxs(
+              "button",
+              {
+                onClick: applyPending,
+                disabled: pending.size === 0,
+                className: "ml-auto px-3 py-1 bg-eagle-accent text-white rounded-md disabled:opacity-40 transition-colors hover:opacity-90",
+                children: [
+                  "Apply",
+                  pending.size > 0 ? ` (${pending.size})` : ""
+                ]
+              }
+            )
+          ] }) : /* @__PURE__ */ jsxRuntimeExports.jsx("span", { className: "text-eagle-text-muted", children: "Click to add tag" }) })
         ]
       }
     )
@@ -7540,12 +7636,17 @@ const TagPanel = () => {
     clipTags,
     isGenerating,
     inferenceError,
-    selectItem,
+    generateItem,
     selectedItem,
     removeAutoTag,
+    removeItemTag,
     addAutoTag,
-    saveTags
+    saveTags,
+    clearItemTags,
+    tagVersion
+    // eslint-disable-line no-unused-vars — consumed only to force re-render on tag changes
   } = useTaggerStore();
+  const generateOnSelect = useSettingsStore((s) => s.generateOnSelect);
   const [showPicker, setShowPicker] = reactExports.useState(false);
   const [pickerStyle, setPickerStyle] = reactExports.useState({});
   const [saveState, setSaveState] = reactExports.useState("idle");
@@ -7570,28 +7671,44 @@ const TagPanel = () => {
   };
   const saveLabel = { idle: "Save Tags", saving: "Saving…", saved: "Saved!", error: "Failed" }[saveState];
   const saveCls = saveState === "saved" ? "bg-green-600 hover:bg-green-600 text-white" : saveState === "error" ? "bg-red-600 hover:bg-red-600 text-white" : "bg-eagle-primary hover:bg-eagle-primary-hover text-white";
-  return /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "bg-eagle-elevated border-l border-eagle-border flex flex-col shadow-2xl flex-[3]", children: [
-    /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex-1 p-4 overflow-y-auto flex flex-wrap gap-2 pt-6 content-start custom-scrollbar [scrollbar-gutter:stable]", children: [
-      /* @__PURE__ */ jsxRuntimeExports.jsx("h2", { className: "w-full text-xl font-bold", children: "Current Tags" }),
-      selectedItem?.tags.map((tag) => /* @__PURE__ */ jsxRuntimeExports.jsx(
+  const currentTags = selectedItem?.tags ?? [];
+  return /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "bg-eagle-elevated border-l border-eagle-border flex flex-col shadow-2xl flex-[3] overflow-hidden", children: [
+    /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex flex-col border-b border-eagle-border", children: [
+      /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex items-center justify-between px-4 pt-4 pb-2", children: [
+        /* @__PURE__ */ jsxRuntimeExports.jsx("h2", { className: "text-xl font-bold text-eagle-text", children: "Current Tags" }),
+        currentTags.length > 0 && /* @__PURE__ */ jsxRuntimeExports.jsx("span", { className: "text-xs text-eagle-text-muted tabular-nums", children: currentTags.length })
+      ] }),
+      currentTags.length > 0 ? /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "px-4 pb-3 overflow-y-auto max-h-40 custom-scrollbar [scrollbar-gutter:stable] flex flex-wrap gap-2 content-start", children: currentTags.map((tag) => /* @__PURE__ */ jsxRuntimeExports.jsxs(
         "span",
         {
-          className: "bg-eagle-btn-bg text-eagle-text px-2 py-1 rounded-lg text-sm border border-eagle-border",
-          children: tag
+          className: "flex items-center gap-1 bg-eagle-btn-bg text-eagle-text px-2 py-1 rounded-lg text-sm border border-eagle-border",
+          children: [
+            tag,
+            /* @__PURE__ */ jsxRuntimeExports.jsx(
+              "button",
+              {
+                onClick: () => removeItemTag(tag),
+                className: "opacity-40 hover:opacity-100 hover:text-eagle-accent leading-none transition-opacity",
+                title: "Remove tag",
+                children: "×"
+              }
+            )
+          ]
         },
         tag
-      )),
-      inferenceError && !isGenerating && /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "w-full bg-red-900/30 border border-red-700/50 rounded-lg px-3 py-2 text-sm text-red-300", children: inferenceError }),
-      isGenerating ? /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex flex-col items-center justify-center gap-4 text-eagle-text-secondary w-full mt-4", children: [
+      )) }) : /* @__PURE__ */ jsxRuntimeExports.jsx("p", { className: "px-4 pb-3 text-sm text-eagle-text-muted italic", children: "No saved tags" })
+    ] }),
+    /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex-1 overflow-y-auto p-4 flex flex-col gap-3 custom-scrollbar [scrollbar-gutter:stable]", children: [
+      inferenceError && !isGenerating && /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "bg-red-900/30 border border-red-700/50 rounded-lg px-3 py-2 text-sm text-red-300", children: inferenceError }),
+      isGenerating ? /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex flex-col items-center justify-center gap-4 text-eagle-text-secondary flex-1", children: [
         /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "w-8 h-8 border-4 border-eagle-border border-t-eagle-accent rounded-full animate-spin" }),
         /* @__PURE__ */ jsxRuntimeExports.jsx("span", { children: "Generating Tags…" })
       ] }) : /* @__PURE__ */ jsxRuntimeExports.jsxs(jsxRuntimeExports.Fragment, { children: [
-        clipTags.length > 0 && /* @__PURE__ */ jsxRuntimeExports.jsxs(jsxRuntimeExports.Fragment, { children: [
-          /* @__PURE__ */ jsxRuntimeExports.jsx("h2", { className: "w-full text-xl font-bold", children: "Library Matches" }),
-          clipTags.map((tag) => {
-            const alreadySaved = selectedItem?.tags?.includes(tag);
-            const inGenerated = autoTags.includes(tag);
-            if (alreadySaved || inGenerated) return null;
+        clipTags.length > 0 && /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex flex-col gap-2", children: [
+          /* @__PURE__ */ jsxRuntimeExports.jsx("h2", { className: "text-lg font-bold text-eagle-text", children: "Library Matches" }),
+          /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "flex flex-wrap gap-2", children: clipTags.map((tag) => {
+            const tagLower = tag.toLowerCase();
+            if (currentTags.some((t) => t.toLowerCase() === tagLower) || autoTags.some((t) => t.toLowerCase() === tagLower)) return null;
             return /* @__PURE__ */ jsxRuntimeExports.jsxs(
               "button",
               {
@@ -7605,55 +7722,63 @@ const TagPanel = () => {
               },
               tag
             );
-          })
+          }) })
         ] }),
-        /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "w-full flex items-center justify-between", children: [
-          /* @__PURE__ */ jsxRuntimeExports.jsx("h2", { className: "text-xl font-bold", children: "Generated Tags" }),
-          /* @__PURE__ */ jsxRuntimeExports.jsx(
-            "button",
-            {
-              ref: triggerRef,
-              onClick: openPicker,
-              className: "w-6 h-6 flex items-center justify-center rounded-md bg-eagle-btn-bg hover:bg-eagle-btn-hover border border-eagle-border text-eagle-text-secondary hover:text-eagle-text transition-colors text-sm leading-none",
-              title: "Add tag from library",
-              children: "+"
-            }
-          )
-        ] }),
-        autoTags.map((tag) => {
-          const alreadySaved = selectedItem?.tags?.includes(tag);
-          return /* @__PURE__ */ jsxRuntimeExports.jsxs(
-            "button",
-            {
-              className: `px-2 py-1 rounded-lg text-sm transition-all border ${alreadySaved ? "bg-eagle-btn-bg border-eagle-border text-eagle-text-muted opacity-60" : "bg-eagle-btn-bg hover:bg-eagle-btn-hover text-eagle-text border-eagle-border"}`,
-              title: alreadySaved ? "Already saved" : void 0,
-              children: [
-                tag,
-                " ",
-                !alreadySaved && /* @__PURE__ */ jsxRuntimeExports.jsx(
-                  "span",
-                  {
-                    onClick: () => removeAutoTag(tag),
-                    className: "opacity-50 hover:text-eagle-accent",
-                    children: "×"
-                  }
-                )
-              ]
-            },
-            tag
-          );
-        })
+        /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex flex-col gap-2", children: [
+          /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex items-center justify-between", children: [
+            /* @__PURE__ */ jsxRuntimeExports.jsx("h2", { className: "text-lg font-bold text-eagle-text", children: "Generated Tags" }),
+            /* @__PURE__ */ jsxRuntimeExports.jsx(
+              "button",
+              {
+                ref: triggerRef,
+                onClick: openPicker,
+                className: "w-6 h-6 flex items-center justify-center rounded-md bg-eagle-btn-bg hover:bg-eagle-btn-hover border border-eagle-border text-eagle-text-secondary hover:text-eagle-text transition-colors text-sm leading-none",
+                title: "Add tag from library",
+                children: "+"
+              }
+            )
+          ] }),
+          /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "flex flex-wrap gap-2", children: autoTags.map((tag) => {
+            const alreadySaved = currentTags.some((t) => t.toLowerCase() === tag.toLowerCase());
+            return /* @__PURE__ */ jsxRuntimeExports.jsxs(
+              "button",
+              {
+                className: `px-2 py-1 rounded-lg text-sm transition-all border ${alreadySaved ? "bg-eagle-btn-bg border-eagle-border text-eagle-text-muted opacity-60" : "bg-eagle-btn-bg hover:bg-eagle-btn-hover text-eagle-text border-eagle-border"}`,
+                title: alreadySaved ? "Already saved" : void 0,
+                children: [
+                  tag,
+                  " ",
+                  !alreadySaved && /* @__PURE__ */ jsxRuntimeExports.jsx("span", { onClick: () => removeAutoTag(tag), className: "opacity-50 hover:text-eagle-accent", children: "×" })
+                ]
+              },
+              tag
+            );
+          }) })
+        ] })
       ] })
     ] }),
     /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "p-4 bg-eagle-panel border-t border-eagle-border flex flex-col gap-3", children: [
-      /* @__PURE__ */ jsxRuntimeExports.jsx(
-        "button",
-        {
-          onClick: () => selectItem(selectedItem),
-          className: "bg-eagle-btn-bg py-3 rounded-lg text-sm font-medium hover:bg-eagle-btn-hover",
-          children: "Regenerate Tags"
-        }
-      ),
+      /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex gap-2", children: [
+        /* @__PURE__ */ jsxRuntimeExports.jsx(
+          "button",
+          {
+            onClick: generateItem,
+            className: "flex-1 bg-eagle-btn-bg py-3 rounded-lg text-sm font-medium hover:bg-eagle-btn-hover",
+            children: generateOnSelect ? "Regenerate" : "Generate"
+          }
+        ),
+        /* @__PURE__ */ jsxRuntimeExports.jsx(
+          "button",
+          {
+            onClick: () => {
+              if (confirm("Clear all tags from this item?")) clearItemTags();
+            },
+            disabled: currentTags.length === 0,
+            className: "flex-1 bg-eagle-btn-bg py-3 rounded-lg text-sm font-medium hover:bg-red-900/40 hover:text-red-400 border border-transparent hover:border-red-700/50 transition-colors disabled:opacity-40",
+            children: "Clear Tags"
+          }
+        )
+      ] }),
       /* @__PURE__ */ jsxRuntimeExports.jsx(
         "button",
         {
@@ -7669,7 +7794,7 @@ const TagPanel = () => {
       {
         onSelect: addAutoTag,
         onClose: () => setShowPicker(false),
-        excludeTags: [...autoTags, ...selectedItem?.tags ?? []],
+        excludeTags: [...autoTags, ...currentTags],
         style: pickerStyle
       }
     )
@@ -7733,16 +7858,23 @@ const Toggle = ({ checked, onChange, label }) => /* @__PURE__ */ jsxRuntimeExpor
   ] }),
   /* @__PURE__ */ jsxRuntimeExports.jsx("span", { className: "text-sm text-eagle-text", children: label })
 ] });
+const DEFAULT_LIBRARY_INSTRUCTION = `Select up to 5 tags from that list that clearly describe something visible in this image — art style, characters, clothing, or setting.
+Do NOT select organizational or collection tags (e.g. "Favorite", "Photos", "References", "To Sort") — only visual descriptions.
+Be selective. Only include a tag if you are confident it applies.`;
 const Settings = () => {
   const {
     llmProvider,
     llmApiKey,
-    llmModel,
+    llmModelOpenAI,
+    llmModelAnthropic,
+    llmModelLocal,
     llmEndpoint,
     llmPrompt,
     llmIncludeLibraryTags,
+    llmLibraryPrompt,
     promptPresets,
     autoSave,
+    generateOnSelect,
     tagBlacklist,
     update
   } = useSettingsStore();
@@ -7772,6 +7904,7 @@ const Settings = () => {
       /* @__PURE__ */ jsxRuntimeExports.jsx("p", { className: "text-eagle-text-secondary mt-1", children: "Configure inference mode and parameters" })
     ] }),
     /* @__PURE__ */ jsxRuntimeExports.jsxs(Section, { title: "General", children: [
+      /* @__PURE__ */ jsxRuntimeExports.jsx(Field, { label: "Generate on select", hint: "Automatically run the LLM when you click an image. Disable to browse without triggering generation — use the Generate button manually.", children: /* @__PURE__ */ jsxRuntimeExports.jsx(Toggle, { checked: generateOnSelect, onChange: (v) => update({ generateOnSelect: v }), label: "Enabled" }) }),
       /* @__PURE__ */ jsxRuntimeExports.jsx(Field, { label: "Auto-save tags", hint: "Automatically save generated tags to Eagle without clicking Save.", children: /* @__PURE__ */ jsxRuntimeExports.jsx(Toggle, { checked: autoSave, onChange: (v) => update({ autoSave: v }), label: "Enabled" }) }),
       /* @__PURE__ */ jsxRuntimeExports.jsxs(Field, { label: "Tag blacklist", hint: "Tags in this list are never added, regardless of inference mode.", children: [
         /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex gap-2", children: [
@@ -7875,21 +8008,30 @@ const Settings = () => {
           )
         }
       ),
-      /* @__PURE__ */ jsxRuntimeExports.jsx(
-        Field,
+      llmProvider === "openai" && /* @__PURE__ */ jsxRuntimeExports.jsx(Field, { label: "Model", hint: "Leave blank to use gpt-4o-mini.", children: /* @__PURE__ */ jsxRuntimeExports.jsx(
+        TextInput,
         {
-          label: "Model",
-          hint: llmProvider === "local" ? "Model name as shown in LM Studio / Ollama (e.g. llava, qwen2-vl). Must support vision." : llmProvider === "openai" ? "Leave blank to use gpt-4o-mini. Other options: gpt-4o" : "Leave blank to use claude-haiku-4-5-20251001. Other options: claude-sonnet-4-6",
-          children: /* @__PURE__ */ jsxRuntimeExports.jsx(
-            TextInput,
-            {
-              value: llmModel,
-              onChange: (v) => update({ llmModel: v }),
-              placeholder: llmProvider === "local" ? "llava" : llmProvider === "openai" ? "gpt-4o-mini" : "claude-haiku-4-5-20251001"
-            }
-          )
+          value: llmModelOpenAI,
+          onChange: (v) => update({ llmModelOpenAI: v }),
+          placeholder: "gpt-4o-mini"
         }
-      ),
+      ) }),
+      llmProvider === "anthropic" && /* @__PURE__ */ jsxRuntimeExports.jsx(Field, { label: "Model", hint: "Leave blank to use claude-haiku-4-5-20251001.", children: /* @__PURE__ */ jsxRuntimeExports.jsx(
+        TextInput,
+        {
+          value: llmModelAnthropic,
+          onChange: (v) => update({ llmModelAnthropic: v }),
+          placeholder: "claude-haiku-4-5-20251001"
+        }
+      ) }),
+      llmProvider === "local" && /* @__PURE__ */ jsxRuntimeExports.jsx(Field, { label: "Model", hint: "Model name as shown in LM Studio / Ollama (e.g. llava, qwen2-vl). Must support vision.", children: /* @__PURE__ */ jsxRuntimeExports.jsx(
+        TextInput,
+        {
+          value: llmModelLocal,
+          onChange: (v) => update({ llmModelLocal: v }),
+          placeholder: "llava"
+        }
+      ) }),
       /* @__PURE__ */ jsxRuntimeExports.jsxs(Field, { label: "Prompt", hint: "The instruction sent to the LLM with the image.", children: [
         /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex items-center gap-2", children: [
           /* @__PURE__ */ jsxRuntimeExports.jsxs(
@@ -7964,19 +8106,42 @@ const Settings = () => {
           }
         )
       ] }),
-      /* @__PURE__ */ jsxRuntimeExports.jsx(
+      /* @__PURE__ */ jsxRuntimeExports.jsxs(
         Field,
         {
           label: "Include library tags",
           hint: "Sends your Eagle tag library to the LLM so it can match existing tags alongside generating new ones.",
-          children: /* @__PURE__ */ jsxRuntimeExports.jsx(
-            Toggle,
-            {
-              checked: llmIncludeLibraryTags,
-              onChange: (v) => update({ llmIncludeLibraryTags: v }),
-              label: "Enabled"
-            }
-          )
+          children: [
+            /* @__PURE__ */ jsxRuntimeExports.jsx(
+              Toggle,
+              {
+                checked: llmIncludeLibraryTags,
+                onChange: (v) => update({ llmIncludeLibraryTags: v }),
+                label: "Enabled"
+              }
+            ),
+            llmIncludeLibraryTags && /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex flex-col gap-1.5 mt-2 pl-3 border-l-2 border-eagle-border", children: [
+              /* @__PURE__ */ jsxRuntimeExports.jsx("label", { className: "text-xs font-medium text-eagle-text-secondary", children: "Library matching instructions" }),
+              /* @__PURE__ */ jsxRuntimeExports.jsx(
+                "textarea",
+                {
+                  value: llmLibraryPrompt || DEFAULT_LIBRARY_INSTRUCTION,
+                  onChange: (e) => update({ llmLibraryPrompt: e.target.value }),
+                  rows: 4,
+                  className: "bg-eagle-btn-bg border border-eagle-border rounded-lg px-3 py-2 text-sm text-eagle-text focus:outline-none focus:border-eagle-accent transition-colors resize-y font-mono"
+                }
+              ),
+              llmLibraryPrompt && llmLibraryPrompt !== DEFAULT_LIBRARY_INSTRUCTION && /* @__PURE__ */ jsxRuntimeExports.jsx(
+                "button",
+                {
+                  onClick: () => update({ llmLibraryPrompt: "" }),
+                  className: "text-xs text-eagle-text-muted hover:text-eagle-text self-start transition-colors",
+                  children: "Reset to default"
+                }
+              ),
+              /* @__PURE__ */ jsxRuntimeExports.jsx("p", { className: "text-xs text-eagle-text-muted", children: "This instruction follows the tag list. The JSON output format is fixed and appended automatically." })
+            ] })
+          ]
         }
       )
     ] })
@@ -8795,7 +8960,7 @@ const GalleryCard = reactExports.memo(({ data: item }) => {
     }
   );
 });
-const DivMasonry = ({ items, containerRef }) => {
+const DivMasonry = ({ items, containerRef, columnWidth = 160 }) => {
   const [size, setSize] = reactExports.useState({ width: 0, height: 0 });
   const [scrollTop, setScrollTop] = reactExports.useState(0);
   const [isScrolling, setIsScrolling] = reactExports.useState(false);
@@ -8821,8 +8986,8 @@ const DivMasonry = ({ items, containerRef }) => {
     };
   }, [containerRef]);
   const positioner = usePositioner(
-    { width: Math.max(0, size.width - 24), columnWidth: 160, columnGutter: 8 },
-    [size.width]
+    { width: Math.max(0, size.width - 24), columnWidth, columnGutter: 8 },
+    [size.width, columnWidth]
   );
   return useMasonry({
     positioner,
@@ -8836,39 +9001,113 @@ const DivMasonry = ({ items, containerRef }) => {
     style: { padding: 12 }
   });
 };
-const Gallery = () => {
-  const { allItems, loadAllItems, batchProgress, tagItems, cancelTagItems, selectItem } = useTaggerStore();
-  const [filter, setFilter] = reactExports.useState("all");
-  const [tagFilters, setTagFilters] = reactExports.useState([]);
-  const [tagInput, setTagInput] = reactExports.useState("");
-  const [showTagPicker, setShowTagPicker] = reactExports.useState(false);
-  const tagPickerBtnRef = reactExports.useRef(null);
-  const [tagPickerStyle, setTagPickerStyle] = reactExports.useState({});
-  const addTagFilter = (tag) => {
-    const t = tag.trim().toLowerCase();
-    if (t && !tagFilters.includes(t)) setTagFilters((prev) => [...prev, t]);
-    setTagInput("");
+const PinBtn = ({ pinned, onClick }) => /* @__PURE__ */ jsxRuntimeExports.jsx(
+  "button",
+  {
+    onClick,
+    title: pinned ? "Unpin from top bar" : "Pin to top bar",
+    className: `ml-auto text-xs px-1.5 py-0.5 rounded border transition-colors ${pinned ? "bg-eagle-accent/20 border-eagle-accent/40 text-eagle-accent" : "bg-eagle-btn-bg border-eagle-border text-eagle-text-muted hover:text-eagle-text hover:border-eagle-accent/40"}`,
+    children: pinned ? "Pinned" : "Pin"
+  }
+);
+const StatusPills = ({ filterStatus, setFilterStatus, options }) => /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "flex rounded-lg border border-eagle-border overflow-hidden text-xs", children: options.map(([val, label]) => /* @__PURE__ */ jsxRuntimeExports.jsx(
+  "button",
+  {
+    onClick: () => setFilterStatus(val),
+    className: `px-3 py-1.5 border-l border-eagle-border first:border-l-0 transition-colors ${filterStatus === val ? "bg-eagle-btn-bg text-eagle-text" : "text-eagle-text-secondary hover:bg-eagle-btn-hover"}`,
+    children: label
+  },
+  val
+)) });
+function useTagPickerPopup() {
+  const [show, setShow] = reactExports.useState(false);
+  const [style, setStyle] = reactExports.useState({});
+  const open = (e) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    setStyle({ top: rect.bottom + 6, left: rect.left });
+    setShow(true);
   };
+  return { show, style, open, close: () => setShow(false) };
+}
+const Gallery = () => {
+  const { allItems, loadAllItems, batchProgress, tagItems, cancelTagItems, selectItem, selectedItem } = useTaggerStore();
+  const [filterStatus, setFilterStatus] = reactExports.useState("all");
+  const [includeTags, setIncludeTags] = reactExports.useState([]);
+  const [includeMode, setIncludeMode] = reactExports.useState("and");
+  const [excludeTags, setExcludeTags] = reactExports.useState([]);
+  const [sortBy, setSortBy] = reactExports.useState("default");
+  const [nameSearch, setNameSearch] = reactExports.useState("");
+  const [showFilterPanel, setShowFilterPanel] = reactExports.useState(false);
+  const [includeInput, setIncludeInput] = reactExports.useState("");
+  const [excludeInput, setExcludeInput] = reactExports.useState("");
+  const { pinnedControls: pinnedArray, update: updateSettings } = useSettingsStore();
+  const pinnedControls = reactExports.useMemo(() => new Set(pinnedArray), [pinnedArray]);
+  const includePicker = useTagPickerPopup();
+  const excludePicker = useTagPickerPopup();
+  const addIncludeTag = (tag) => {
+    const t = tag.trim().toLowerCase();
+    if (t && !includeTags.includes(t)) setIncludeTags((prev) => [...prev, t]);
+    setIncludeInput("");
+  };
+  const addExcludeTag = (tag) => {
+    const t = tag.trim().toLowerCase();
+    if (t && !excludeTags.includes(t)) setExcludeTags((prev) => [...prev, t]);
+    setExcludeInput("");
+  };
+  const togglePin = (name) => {
+    updateSettings({
+      pinnedControls: pinnedArray.includes(name) ? pinnedArray.filter((x) => x !== name) : [...pinnedArray, name]
+    });
+  };
+  const clearAllFilters = () => {
+    setFilterStatus("all");
+    setIncludeTags([]);
+    setExcludeTags([]);
+    setSortBy("default");
+    setIncludeMode("and");
+    setNameSearch("");
+  };
+  const hasActiveFilters = filterStatus !== "all" || includeTags.length > 0 || excludeTags.length > 0 || sortBy !== "default" || nameSearch.trim() !== "";
+  const [columnWidth, setColumnWidth] = reactExports.useState(160);
+  const [debouncedColumnWidth, setDebouncedColumnWidth] = reactExports.useState(160);
+  reactExports.useEffect(() => {
+    const t = setTimeout(() => setDebouncedColumnWidth(columnWidth), 150);
+    return () => clearTimeout(t);
+  }, [columnWidth]);
   const [viewMode, setViewMode] = reactExports.useState("grid");
   const [selectedIds, setSelectedIds] = reactExports.useState(/* @__PURE__ */ new Set());
   const [selectMode, setSelectMode] = reactExports.useState(false);
   const scrollRef = reactExports.useRef(null);
   const lastClickedIdxRef = reactExports.useRef(null);
+  const touchStartX = reactExports.useRef(null);
   const loaded = reactExports.useRef(false);
   if (!loaded.current) {
     loaded.current = true;
     loadAllItems();
   }
   const filteredItems = reactExports.useMemo(() => {
-    let items = filter === "untagged" ? allItems.filter((x) => x && (!x.tags || x.tags.length === 0)) : allItems.filter(Boolean);
-    if (tagFilters.length > 0) {
-      items = items.filter(
-        (x) => tagFilters.every((f) => x.tags?.some((t) => t.toLowerCase().includes(f)))
-      );
+    let items = allItems.filter(Boolean);
+    if (nameSearch.trim()) {
+      const q = nameSearch.trim().toLowerCase();
+      items = items.filter((x) => x.name?.toLowerCase().includes(q));
     }
+    if (filterStatus === "untagged") items = items.filter((x) => !x.tags?.length);
+    else if (filterStatus === "tagged") items = items.filter((x) => x.tags?.length > 0);
+    if (includeTags.length > 0) {
+      items = includeMode === "and" ? items.filter((x) => includeTags.every((f) => x.tags?.some((t) => typeof t === "string" && t.toLowerCase().includes(f)))) : items.filter((x) => includeTags.some((f) => x.tags?.some((t) => typeof t === "string" && t.toLowerCase().includes(f))));
+    }
+    if (excludeTags.length > 0) {
+      items = items.filter((x) => !excludeTags.some((f) => x.tags?.some((t) => typeof t === "string" && t.toLowerCase().includes(f))));
+    }
+    if (sortBy === "name-asc") items = [...items].sort((a, b) => a.name.localeCompare(b.name));
+    else if (sortBy === "name-desc") items = [...items].sort((a, b) => b.name.localeCompare(a.name));
+    else if (sortBy === "tags-asc") items = [...items].sort((a, b) => (a.tags?.length ?? 0) - (b.tags?.length ?? 0));
+    else if (sortBy === "tags-desc") items = [...items].sort((a, b) => (b.tags?.length ?? 0) - (a.tags?.length ?? 0));
     return items;
-  }, [allItems, filter, tagFilters]);
-  const untaggedCount = allItems.filter((x) => !x.tags || x.tags.length === 0).length;
+  }, [allItems, nameSearch, filterStatus, includeTags, includeMode, excludeTags, sortBy]);
+  const masonryKey = `${filterStatus}|${nameSearch}|${includeTags.join(",")}|${excludeTags.join(",")}|${includeMode}|${sortBy}`;
+  const untaggedCount = allItems.filter((x) => !x.tags?.length).length;
+  const taggedCount = allItems.filter((x) => x.tags?.length > 0).length;
   const handleItemClick = reactExports.useCallback((item, e) => {
     if (batchProgress) return;
     const idx = filteredItems.findIndex((x) => x.id === item.id);
@@ -8919,120 +9158,224 @@ const Gallery = () => {
     });
     lastClickedIdxRef.current = idx;
   }, [batchProgress, filteredItems]);
-  const ctxValue = { selectedIds, onItemClick: handleItemClick, onCheckboxClick: handleCheckboxClick, selectMode };
+  const ctxValue = reactExports.useMemo(
+    () => ({ selectedIds, onItemClick: handleItemClick, onCheckboxClick: handleCheckboxClick, selectMode }),
+    [selectedIds, handleItemClick, handleCheckboxClick, selectMode]
+  );
+  const detailIdx = filteredItems.findIndex((x) => x.id === selectedItem?.id);
+  const goTo = reactExports.useCallback((idx) => {
+    if (idx < 0 || idx >= filteredItems.length) return;
+    selectItem(filteredItems[idx]);
+  }, [filteredItems, selectItem]);
+  reactExports.useEffect(() => {
+    if (viewMode !== "detail") return;
+    const onKey = (e) => {
+      if (e.key === "ArrowRight") goTo(detailIdx + 1);
+      else if (e.key === "ArrowLeft") goTo(detailIdx - 1);
+      else if (e.key === "Escape") setViewMode("grid");
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [viewMode, detailIdx, goTo]);
   if (viewMode === "detail") {
-    return /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex-1 flex flex-col overflow-hidden", children: [
-      /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "px-4 py-2 border-b border-eagle-border bg-eagle-panel flex items-center gap-3", children: /* @__PURE__ */ jsxRuntimeExports.jsx(
-        "button",
-        {
-          onClick: () => setViewMode("grid"),
-          className: "flex items-center gap-1.5 text-sm text-eagle-text-secondary hover:text-eagle-text transition-colors",
-          children: "← Gallery"
-        }
-      ) }),
-      /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex flex-1 overflow-hidden", children: [
-        /* @__PURE__ */ jsxRuntimeExports.jsx(ImagePreview, {}),
-        /* @__PURE__ */ jsxRuntimeExports.jsx(TagPanel, {})
-      ] })
-    ] });
+    return /* @__PURE__ */ jsxRuntimeExports.jsxs(
+      "div",
+      {
+        className: "flex-1 flex flex-col overflow-hidden",
+        onTouchStart: (e) => {
+          touchStartX.current = e.touches[0].clientX;
+        },
+        onTouchEnd: (e) => {
+          if (touchStartX.current === null) return;
+          const dx = e.changedTouches[0].clientX - touchStartX.current;
+          if (Math.abs(dx) > 50) goTo(detailIdx + (dx < 0 ? 1 : -1));
+          touchStartX.current = null;
+        },
+        children: [
+          /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "px-4 py-2 border-b border-eagle-border bg-eagle-panel flex items-center gap-3", children: [
+            /* @__PURE__ */ jsxRuntimeExports.jsx(
+              "button",
+              {
+                onClick: () => setViewMode("grid"),
+                className: "flex items-center gap-1.5 text-sm text-eagle-text-secondary hover:text-eagle-text transition-colors",
+                children: "← Gallery"
+              }
+            ),
+            /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex items-center gap-1 ml-auto", children: [
+              /* @__PURE__ */ jsxRuntimeExports.jsx(
+                "button",
+                {
+                  onClick: () => goTo(detailIdx - 1),
+                  disabled: detailIdx <= 0,
+                  className: "px-2 py-1 text-sm bg-eagle-btn-bg hover:bg-eagle-btn-hover border border-eagle-border rounded-lg text-eagle-text-secondary hover:text-eagle-text transition-colors disabled:opacity-30",
+                  children: "‹"
+                }
+              ),
+              /* @__PURE__ */ jsxRuntimeExports.jsxs("span", { className: "text-xs text-eagle-text-muted tabular-nums px-1", children: [
+                detailIdx + 1,
+                " / ",
+                filteredItems.length
+              ] }),
+              /* @__PURE__ */ jsxRuntimeExports.jsx(
+                "button",
+                {
+                  onClick: () => goTo(detailIdx + 1),
+                  disabled: detailIdx >= filteredItems.length - 1,
+                  className: "px-2 py-1 text-sm bg-eagle-btn-bg hover:bg-eagle-btn-hover border border-eagle-border rounded-lg text-eagle-text-secondary hover:text-eagle-text transition-colors disabled:opacity-30",
+                  children: "›"
+                }
+              )
+            ] })
+          ] }),
+          /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex flex-1 overflow-hidden", children: [
+            /* @__PURE__ */ jsxRuntimeExports.jsx(ImagePreview, {}),
+            /* @__PURE__ */ jsxRuntimeExports.jsx(TagPanel, {})
+          ] })
+        ]
+      }
+    );
   }
   return /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex-1 flex flex-col overflow-hidden", children: [
-    /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "px-4 py-2 border-b border-eagle-border bg-eagle-panel flex items-center gap-3 flex-wrap", children: [
-      /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex rounded-lg border border-eagle-border overflow-hidden text-sm", children: [
-        /* @__PURE__ */ jsxRuntimeExports.jsxs(
-          "button",
-          {
-            onClick: () => setFilter("all"),
-            className: `px-3 py-1.5 transition-colors ${filter === "all" ? "bg-eagle-btn-bg text-eagle-text" : "text-eagle-text-secondary hover:bg-eagle-btn-hover"}`,
-            children: [
-              "All (",
-              allItems.length,
-              ")"
-            ]
-          }
-        ),
-        /* @__PURE__ */ jsxRuntimeExports.jsxs(
-          "button",
-          {
-            onClick: () => setFilter("untagged"),
-            className: `px-3 py-1.5 border-l border-eagle-border transition-colors ${filter === "untagged" ? "bg-eagle-btn-bg text-eagle-text" : "text-eagle-text-secondary hover:bg-eagle-btn-hover"}`,
-            children: [
-              "Untagged (",
-              untaggedCount,
-              ")"
-            ]
-          }
-        )
+    /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "px-4 py-2 border-b border-eagle-border bg-eagle-panel flex items-center gap-2 flex-wrap", children: [
+      /* @__PURE__ */ jsxRuntimeExports.jsxs(
+        "button",
+        {
+          onClick: () => setShowFilterPanel((v) => !v),
+          className: `px-3 py-1.5 text-sm rounded-lg border transition-colors flex items-center gap-1.5 ${showFilterPanel || hasActiveFilters ? "bg-eagle-accent/20 border-eagle-accent/50 text-eagle-text" : "bg-eagle-btn-bg hover:bg-eagle-btn-hover border-eagle-border text-eagle-text"}`,
+          children: [
+            "Filters",
+            hasActiveFilters && /* @__PURE__ */ jsxRuntimeExports.jsx("span", { className: "w-1.5 h-1.5 rounded-full bg-eagle-accent" })
+          ]
+        }
+      ),
+      /* @__PURE__ */ jsxRuntimeExports.jsxs("span", { className: "text-xs text-eagle-text-muted", children: [
+        filteredItems.length,
+        " / ",
+        allItems.length
       ] }),
-      /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex items-center gap-1 flex-wrap", children: [
+      /* @__PURE__ */ jsxRuntimeExports.jsx(
+        "input",
+        {
+          type: "range",
+          min: 100,
+          max: 300,
+          step: 20,
+          value: columnWidth,
+          onChange: (e) => setColumnWidth(Number(e.target.value)),
+          title: `Thumbnail size: ${columnWidth}px`,
+          className: "w-20 accent-eagle-accent"
+        }
+      ),
+      pinnedControls.has("search") && /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "relative", children: [
         /* @__PURE__ */ jsxRuntimeExports.jsx(
           "input",
           {
             type: "text",
-            value: tagInput,
-            onChange: (e) => setTagInput(e.target.value),
-            onKeyDown: (e) => {
-              if (e.key === "Enter" && tagInput.trim()) addTagFilter(tagInput);
-            },
-            placeholder: "Filter by tag…",
-            className: "px-3 py-1.5 text-sm bg-eagle-btn-bg border border-eagle-border rounded-lg text-eagle-text placeholder:text-eagle-text-muted focus:outline-none focus:border-eagle-accent transition-colors w-36"
+            value: nameSearch,
+            onChange: (e) => setNameSearch(e.target.value),
+            placeholder: "Search name…",
+            className: "pl-6 pr-5 py-1 text-xs bg-eagle-btn-bg border border-eagle-border rounded-lg text-eagle-text placeholder:text-eagle-text-muted focus:outline-none focus:border-eagle-accent transition-colors w-36"
+          }
+        ),
+        /* @__PURE__ */ jsxRuntimeExports.jsx("svg", { className: "absolute left-1.5 top-1/2 -translate-y-1/2 w-3 h-3 text-eagle-text-muted pointer-events-none", fill: "none", stroke: "currentColor", viewBox: "0 0 24 24", children: /* @__PURE__ */ jsxRuntimeExports.jsx("path", { strokeLinecap: "round", strokeLinejoin: "round", strokeWidth: 2, d: "M21 21l-4.35-4.35M17 11A6 6 0 1 1 5 11a6 6 0 0 1 12 0z" }) }),
+        nameSearch && /* @__PURE__ */ jsxRuntimeExports.jsx("button", { onClick: () => setNameSearch(""), className: "absolute right-1.5 top-1/2 -translate-y-1/2 text-eagle-text-muted hover:text-eagle-text leading-none text-xs", children: "×" })
+      ] }),
+      pinnedControls.has("status") && /* @__PURE__ */ jsxRuntimeExports.jsx(
+        StatusPills,
+        {
+          filterStatus,
+          setFilterStatus,
+          options: [["all", "All"], ["tagged", "Tagged"], ["untagged", "Untagged"]]
+        }
+      ),
+      pinnedControls.has("sort") && /* @__PURE__ */ jsxRuntimeExports.jsxs(
+        "select",
+        {
+          value: sortBy,
+          onChange: (e) => setSortBy(e.target.value),
+          className: "px-2 py-1 text-xs bg-eagle-btn-bg border border-eagle-border rounded-lg text-eagle-text focus:outline-none focus:border-eagle-accent transition-colors",
+          children: [
+            /* @__PURE__ */ jsxRuntimeExports.jsx("option", { value: "default", children: "Default order" }),
+            /* @__PURE__ */ jsxRuntimeExports.jsx("option", { value: "name-asc", children: "Name A→Z" }),
+            /* @__PURE__ */ jsxRuntimeExports.jsx("option", { value: "name-desc", children: "Name Z→A" }),
+            /* @__PURE__ */ jsxRuntimeExports.jsx("option", { value: "tags-asc", children: "Fewest tags" }),
+            /* @__PURE__ */ jsxRuntimeExports.jsx("option", { value: "tags-desc", children: "Most tags" })
+          ]
+        }
+      ),
+      pinnedControls.has("include") && /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex items-center gap-1 flex-wrap", children: [
+        /* @__PURE__ */ jsxRuntimeExports.jsx("span", { className: "text-xs text-eagle-text-muted", children: "Include:" }),
+        /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "flex rounded border border-eagle-border overflow-hidden text-xs", children: ["and", "or"].map((m) => /* @__PURE__ */ jsxRuntimeExports.jsx(
+          "button",
+          {
+            onClick: () => setIncludeMode(m),
+            className: `px-1.5 py-0.5 border-l border-eagle-border first:border-l-0 uppercase transition-colors ${includeMode === m ? "bg-eagle-accent text-white" : "text-eagle-text-secondary hover:bg-eagle-btn-hover"}`,
+            children: m
+          },
+          m
+        )) }),
+        includeTags.map((f) => /* @__PURE__ */ jsxRuntimeExports.jsxs("span", { className: "flex items-center gap-0.5 bg-eagle-accent/20 border border-eagle-accent/40 rounded px-1.5 py-0.5 text-xs text-eagle-text", children: [
+          f,
+          /* @__PURE__ */ jsxRuntimeExports.jsx("button", { onClick: () => setIncludeTags((p) => p.filter((t) => t !== f)), className: "opacity-60 hover:opacity-100 leading-none", children: "×" })
+        ] }, f)),
+        /* @__PURE__ */ jsxRuntimeExports.jsx(
+          "button",
+          {
+            onClick: includePicker.open,
+            className: "px-1.5 py-0.5 bg-eagle-btn-bg hover:bg-eagle-btn-hover border border-eagle-border rounded text-eagle-text-secondary hover:text-eagle-text transition-colors text-xs leading-none",
+            children: "+"
+          }
+        )
+      ] }),
+      pinnedControls.has("exclude") && /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex items-center gap-1 flex-wrap", children: [
+        /* @__PURE__ */ jsxRuntimeExports.jsx("span", { className: "text-xs text-eagle-text-muted", children: "Exclude:" }),
+        excludeTags.map((f) => /* @__PURE__ */ jsxRuntimeExports.jsxs("span", { className: "flex items-center gap-0.5 bg-red-900/20 border border-red-700/30 rounded px-1.5 py-0.5 text-xs text-eagle-text", children: [
+          f,
+          /* @__PURE__ */ jsxRuntimeExports.jsx("button", { onClick: () => setExcludeTags((p) => p.filter((t) => t !== f)), className: "opacity-60 hover:opacity-100 leading-none", children: "×" })
+        ] }, f)),
+        /* @__PURE__ */ jsxRuntimeExports.jsx(
+          "button",
+          {
+            onClick: excludePicker.open,
+            className: "px-1.5 py-0.5 bg-eagle-btn-bg hover:bg-eagle-btn-hover border border-eagle-border rounded text-eagle-text-secondary hover:text-eagle-text transition-colors text-xs leading-none",
+            children: "+"
+          }
+        )
+      ] }),
+      /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex items-center gap-2 ml-auto", children: [
+        /* @__PURE__ */ jsxRuntimeExports.jsx(
+          "button",
+          {
+            onClick: toggleSelectMode,
+            className: `px-3 py-1.5 text-sm rounded-lg border transition-colors ${selectMode ? "bg-eagle-accent text-white border-eagle-accent" : "bg-eagle-btn-bg hover:bg-eagle-btn-hover border-eagle-border text-eagle-text"}`,
+            children: selectMode ? `Selecting (${selectedIds.size})` : "Select"
+          }
+        ),
+        selectedIds.size > 0 && /* @__PURE__ */ jsxRuntimeExports.jsxs(
+          "button",
+          {
+            onClick: handleTagSelected,
+            disabled: !!batchProgress,
+            className: "px-3 py-1.5 text-sm bg-eagle-primary hover:bg-eagle-primary-hover text-white rounded-lg transition-colors disabled:opacity-50",
+            children: [
+              "Tag Selected (",
+              selectedIds.size,
+              ")"
+            ]
           }
         ),
         /* @__PURE__ */ jsxRuntimeExports.jsx(
           "button",
           {
-            ref: tagPickerBtnRef,
-            onClick: () => {
-              const rect = tagPickerBtnRef.current?.getBoundingClientRect();
-              if (rect) setTagPickerStyle({ top: rect.bottom + 6, left: rect.left });
-              setShowTagPicker((v) => !v);
-            },
-            title: "Pick tag from library",
-            className: "px-2 py-1.5 bg-eagle-btn-bg hover:bg-eagle-btn-hover border border-eagle-border rounded-lg text-eagle-text-secondary hover:text-eagle-text transition-colors text-sm leading-none",
-            children: "⌖"
+            onClick: () => tagItems(filteredItems),
+            disabled: !!batchProgress || filteredItems.length === 0,
+            className: "px-3 py-1.5 text-sm bg-eagle-btn-bg hover:bg-eagle-btn-hover border border-eagle-border text-eagle-text rounded-lg transition-colors disabled:opacity-50",
+            children: "Tag All"
           }
-        ),
-        tagFilters.map((f) => /* @__PURE__ */ jsxRuntimeExports.jsxs("span", { className: "flex items-center gap-1 bg-eagle-accent/20 border border-eagle-accent/40 rounded px-2 py-0.5 text-xs text-eagle-text", children: [
-          f,
-          /* @__PURE__ */ jsxRuntimeExports.jsx("button", { onClick: () => setTagFilters((prev) => prev.filter((t) => t !== f)), className: "opacity-60 hover:opacity-100 leading-none", children: "×" })
-        ] }, f)),
-        tagFilters.length > 0 && /* @__PURE__ */ jsxRuntimeExports.jsx("button", { onClick: () => setTagFilters([]), className: "text-xs text-eagle-text-muted hover:text-eagle-text transition-colors", title: "Clear all filters", children: "Clear" })
+        )
       ] }),
-      /* @__PURE__ */ jsxRuntimeExports.jsx(
-        "button",
-        {
-          onClick: toggleSelectMode,
-          className: `px-3 py-1.5 text-sm rounded-lg border transition-colors ${selectMode ? "bg-eagle-accent text-white border-eagle-accent" : "bg-eagle-btn-bg hover:bg-eagle-btn-hover border-eagle-border text-eagle-text"}`,
-          children: selectMode ? `Selecting (${selectedIds.size})` : "Select"
-        }
-      ),
-      selectedIds.size > 0 && /* @__PURE__ */ jsxRuntimeExports.jsxs(
-        "button",
-        {
-          onClick: handleTagSelected,
-          disabled: !!batchProgress,
-          className: "px-3 py-1.5 text-sm bg-eagle-primary hover:bg-eagle-primary-hover text-white rounded-lg transition-colors disabled:opacity-50",
-          children: [
-            "Tag Selected (",
-            selectedIds.size,
-            ")"
-          ]
-        }
-      ),
-      /* @__PURE__ */ jsxRuntimeExports.jsxs(
-        "button",
-        {
-          onClick: () => tagItems(filteredItems),
-          disabled: !!batchProgress || filteredItems.length === 0,
-          className: "px-3 py-1.5 text-sm bg-eagle-btn-bg hover:bg-eagle-btn-hover border border-eagle-border text-eagle-text rounded-lg transition-colors disabled:opacity-50",
-          children: [
-            "Tag All ",
-            filter === "untagged" ? "Untagged" : ""
-          ]
-        }
-      ),
-      batchProgress && /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex items-center gap-2 ml-auto", children: [
-        /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "w-32 h-1.5 bg-eagle-btn-bg rounded-full overflow-hidden", children: /* @__PURE__ */ jsxRuntimeExports.jsx(
+      batchProgress && /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex items-center gap-2 w-full", children: [
+        /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "flex-1 h-1.5 bg-eagle-btn-bg rounded-full overflow-hidden", children: /* @__PURE__ */ jsxRuntimeExports.jsx(
           "div",
           {
             className: "h-full bg-eagle-accent rounded-full transition-all duration-200",
@@ -9054,29 +9397,182 @@ const Gallery = () => {
         )
       ] })
     ] }),
-    allItems.length === 0 ? /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "flex-1 flex items-center justify-center text-eagle-text-muted italic text-sm", children: "No items in library" }) : filteredItems.length === 0 ? /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "flex-1 flex items-center justify-center text-eagle-text-muted italic text-sm", children: "All images are tagged" }) : /* @__PURE__ */ jsxRuntimeExports.jsx(GalleryCtx.Provider, { value: ctxValue, children: /* @__PURE__ */ jsxRuntimeExports.jsx("div", { ref: scrollRef, className: "flex-1 overflow-y-auto custom-scrollbar [scrollbar-gutter:stable]", children: /* @__PURE__ */ jsxRuntimeExports.jsx(DivMasonry, { items: filteredItems, containerRef: scrollRef }) }) }),
-    showTagPicker && /* @__PURE__ */ jsxRuntimeExports.jsx(
+    showFilterPanel && /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "px-4 py-3 border-b border-eagle-border bg-eagle-panel flex flex-col gap-3", children: [
+      /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex flex-col gap-1", children: [
+        /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex items-center gap-2", children: [
+          /* @__PURE__ */ jsxRuntimeExports.jsx("span", { className: "text-xs text-eagle-text-muted font-medium", children: "Search by name" }),
+          /* @__PURE__ */ jsxRuntimeExports.jsx(PinBtn, { pinned: pinnedControls.has("search"), onClick: () => togglePin("search") })
+        ] }),
+        /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "relative w-64", children: [
+          /* @__PURE__ */ jsxRuntimeExports.jsx(
+            "input",
+            {
+              type: "text",
+              value: nameSearch,
+              onChange: (e) => setNameSearch(e.target.value),
+              placeholder: "Filter by filename…",
+              className: "w-full pl-7 pr-2 py-1.5 text-xs bg-eagle-btn-bg border border-eagle-border rounded-lg text-eagle-text placeholder:text-eagle-text-muted focus:outline-none focus:border-eagle-accent transition-colors"
+            }
+          ),
+          /* @__PURE__ */ jsxRuntimeExports.jsx("svg", { className: "absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-eagle-text-muted pointer-events-none", fill: "none", stroke: "currentColor", viewBox: "0 0 24 24", children: /* @__PURE__ */ jsxRuntimeExports.jsx("path", { strokeLinecap: "round", strokeLinejoin: "round", strokeWidth: 2, d: "M21 21l-4.35-4.35M17 11A6 6 0 1 1 5 11a6 6 0 0 1 12 0z" }) }),
+          nameSearch && /* @__PURE__ */ jsxRuntimeExports.jsx("button", { onClick: () => setNameSearch(""), className: "absolute right-2 top-1/2 -translate-y-1/2 text-eagle-text-muted hover:text-eagle-text leading-none", children: "×" })
+        ] })
+      ] }),
+      /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex items-center gap-4 flex-wrap", children: [
+        /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex flex-col gap-1", children: [
+          /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex items-center gap-2", children: [
+            /* @__PURE__ */ jsxRuntimeExports.jsx("span", { className: "text-xs text-eagle-text-muted font-medium", children: "Status" }),
+            /* @__PURE__ */ jsxRuntimeExports.jsx(PinBtn, { pinned: pinnedControls.has("status"), onClick: () => togglePin("status") })
+          ] }),
+          /* @__PURE__ */ jsxRuntimeExports.jsx(
+            StatusPills,
+            {
+              filterStatus,
+              setFilterStatus,
+              options: [
+                ["all", `All (${allItems.length})`],
+                ["tagged", `Tagged (${taggedCount})`],
+                ["untagged", `Untagged (${untaggedCount})`]
+              ]
+            }
+          )
+        ] }),
+        /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex flex-col gap-1", children: [
+          /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex items-center gap-2", children: [
+            /* @__PURE__ */ jsxRuntimeExports.jsx("span", { className: "text-xs text-eagle-text-muted font-medium", children: "Sort" }),
+            /* @__PURE__ */ jsxRuntimeExports.jsx(PinBtn, { pinned: pinnedControls.has("sort"), onClick: () => togglePin("sort") })
+          ] }),
+          /* @__PURE__ */ jsxRuntimeExports.jsxs(
+            "select",
+            {
+              value: sortBy,
+              onChange: (e) => setSortBy(e.target.value),
+              className: "px-2 py-1.5 text-xs bg-eagle-btn-bg border border-eagle-border rounded-lg text-eagle-text focus:outline-none focus:border-eagle-accent transition-colors",
+              children: [
+                /* @__PURE__ */ jsxRuntimeExports.jsx("option", { value: "default", children: "Default" }),
+                /* @__PURE__ */ jsxRuntimeExports.jsx("option", { value: "name-asc", children: "Name A→Z" }),
+                /* @__PURE__ */ jsxRuntimeExports.jsx("option", { value: "name-desc", children: "Name Z→A" }),
+                /* @__PURE__ */ jsxRuntimeExports.jsx("option", { value: "tags-asc", children: "Fewest tags first" }),
+                /* @__PURE__ */ jsxRuntimeExports.jsx("option", { value: "tags-desc", children: "Most tags first" })
+              ]
+            }
+          )
+        ] }),
+        hasActiveFilters && /* @__PURE__ */ jsxRuntimeExports.jsx("button", { onClick: clearAllFilters, className: "text-xs text-eagle-text-muted hover:text-red-400 transition-colors mt-4", children: "Clear all" })
+      ] }),
+      /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex flex-col gap-1", children: [
+        /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex items-center gap-2", children: [
+          /* @__PURE__ */ jsxRuntimeExports.jsx("span", { className: "text-xs text-eagle-text-muted font-medium", children: "Include tags" }),
+          /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "flex rounded border border-eagle-border overflow-hidden text-xs", children: ["and", "or"].map((m) => /* @__PURE__ */ jsxRuntimeExports.jsx(
+            "button",
+            {
+              onClick: () => setIncludeMode(m),
+              className: `px-2 py-0.5 border-l border-eagle-border first:border-l-0 transition-colors uppercase ${includeMode === m ? "bg-eagle-accent text-white" : "text-eagle-text-secondary hover:bg-eagle-btn-hover"}`,
+              children: m
+            },
+            m
+          )) }),
+          /* @__PURE__ */ jsxRuntimeExports.jsx(PinBtn, { pinned: pinnedControls.has("include"), onClick: () => togglePin("include") })
+        ] }),
+        /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex items-center gap-1 flex-wrap", children: [
+          /* @__PURE__ */ jsxRuntimeExports.jsx(
+            "input",
+            {
+              type: "text",
+              value: includeInput,
+              onChange: (e) => setIncludeInput(e.target.value),
+              onKeyDown: (e) => {
+                if (e.key === "Enter" && includeInput.trim()) addIncludeTag(includeInput);
+              },
+              placeholder: "Add tag…",
+              className: "px-2 py-1 text-xs bg-eagle-btn-bg border border-eagle-border rounded-lg text-eagle-text placeholder:text-eagle-text-muted focus:outline-none focus:border-eagle-accent transition-colors w-32"
+            }
+          ),
+          /* @__PURE__ */ jsxRuntimeExports.jsx(
+            "button",
+            {
+              onClick: includePicker.open,
+              className: "px-2 py-1 bg-eagle-btn-bg hover:bg-eagle-btn-hover border border-eagle-border rounded-lg text-eagle-text-secondary hover:text-eagle-text transition-colors text-xs leading-none",
+              children: "⌖"
+            }
+          ),
+          includeTags.map((f) => /* @__PURE__ */ jsxRuntimeExports.jsxs("span", { className: "flex items-center gap-1 bg-eagle-accent/20 border border-eagle-accent/40 rounded px-2 py-0.5 text-xs text-eagle-text", children: [
+            f,
+            /* @__PURE__ */ jsxRuntimeExports.jsx("button", { onClick: () => setIncludeTags((p) => p.filter((t) => t !== f)), className: "opacity-60 hover:opacity-100 leading-none", children: "×" })
+          ] }, f))
+        ] })
+      ] }),
+      /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex flex-col gap-1", children: [
+        /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex items-center gap-2", children: [
+          /* @__PURE__ */ jsxRuntimeExports.jsx("span", { className: "text-xs text-eagle-text-muted font-medium", children: "Exclude tags" }),
+          /* @__PURE__ */ jsxRuntimeExports.jsx(PinBtn, { pinned: pinnedControls.has("exclude"), onClick: () => togglePin("exclude") })
+        ] }),
+        /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "flex items-center gap-1 flex-wrap", children: [
+          /* @__PURE__ */ jsxRuntimeExports.jsx(
+            "input",
+            {
+              type: "text",
+              value: excludeInput,
+              onChange: (e) => setExcludeInput(e.target.value),
+              onKeyDown: (e) => {
+                if (e.key === "Enter" && excludeInput.trim()) addExcludeTag(excludeInput);
+              },
+              placeholder: "Add tag…",
+              className: "px-2 py-1 text-xs bg-eagle-btn-bg border border-eagle-border rounded-lg text-eagle-text placeholder:text-eagle-text-muted focus:outline-none focus:border-eagle-accent transition-colors w-32"
+            }
+          ),
+          /* @__PURE__ */ jsxRuntimeExports.jsx(
+            "button",
+            {
+              onClick: excludePicker.open,
+              className: "px-2 py-1 bg-eagle-btn-bg hover:bg-eagle-btn-hover border border-eagle-border rounded-lg text-eagle-text-secondary hover:text-eagle-text transition-colors text-xs leading-none",
+              children: "⌖"
+            }
+          ),
+          excludeTags.map((f) => /* @__PURE__ */ jsxRuntimeExports.jsxs("span", { className: "flex items-center gap-1 bg-red-900/20 border border-red-700/30 rounded px-2 py-0.5 text-xs text-eagle-text", children: [
+            f,
+            /* @__PURE__ */ jsxRuntimeExports.jsx("button", { onClick: () => setExcludeTags((p) => p.filter((t) => t !== f)), className: "opacity-60 hover:opacity-100 leading-none", children: "×" })
+          ] }, f))
+        ] })
+      ] })
+    ] }),
+    allItems.length === 0 ? /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "flex-1 flex items-center justify-center text-eagle-text-muted italic text-sm", children: "No items in library" }) : filteredItems.length === 0 ? /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "flex-1 flex items-center justify-center text-eagle-text-muted italic text-sm", children: "No items match the current filters" }) : /* @__PURE__ */ jsxRuntimeExports.jsx(GalleryCtx.Provider, { value: ctxValue, children: /* @__PURE__ */ jsxRuntimeExports.jsx("div", { ref: scrollRef, className: "flex-1 overflow-y-auto custom-scrollbar [scrollbar-gutter:stable]", children: /* @__PURE__ */ jsxRuntimeExports.jsx(DivMasonry, { items: filteredItems, containerRef: scrollRef, columnWidth: debouncedColumnWidth }, masonryKey) }) }),
+    includePicker.show && /* @__PURE__ */ jsxRuntimeExports.jsx(
       TagPicker,
       {
-        onSelect: (tag) => {
-          addTagFilter(tag);
-          setShowTagPicker(false);
-        },
-        excludeTags: tagFilters,
-        onClose: () => setShowTagPicker(false),
-        style: tagPickerStyle
+        multi: true,
+        onMultiSelect: (tags) => tags.forEach(addIncludeTag),
+        excludeTags: includeTags,
+        onClose: includePicker.close,
+        style: includePicker.style
+      }
+    ),
+    excludePicker.show && /* @__PURE__ */ jsxRuntimeExports.jsx(
+      TagPicker,
+      {
+        multi: true,
+        onMultiSelect: (tags) => tags.forEach(addExcludeTag),
+        excludeTags,
+        onClose: excludePicker.close,
+        style: excludePicker.style
       }
     )
   ] });
 };
 function syncSettingsToBridge(state) {
+  const modelByProvider = {
+    openai: state.llmModelOpenAI,
+    anthropic: state.llmModelAnthropic,
+    local: state.llmModelLocal
+  };
   window.__autoTaggerInference?.configure?.({
     llmProvider: state.llmProvider,
     llmApiKey: state.llmApiKey,
-    llmModel: state.llmModel,
+    llmModel: modelByProvider[state.llmProvider] || "",
     llmEndpoint: state.llmEndpoint,
     llmPrompt: state.llmPrompt,
-    llmIncludeLibraryTags: state.llmIncludeLibraryTags
+    llmIncludeLibraryTags: state.llmIncludeLibraryTags,
+    llmLibraryPrompt: state.llmLibraryPrompt
   });
 }
 class ErrorBoundary extends reactExports.Component {
@@ -9105,6 +9601,19 @@ class ErrorBoundary extends reactExports.Component {
 function App() {
   const [activeSection, setActiveSection] = reactExports.useState("auto");
   const { setItems, loadUserTags } = useTaggerStore();
+  reactExports.useEffect(() => {
+    if (activeSection !== "auto") return;
+    const onKey = (e) => {
+      if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+      const { items, selectedItem, selectItem } = useTaggerStore.getState();
+      const idx = items.findIndex((x) => x.id === selectedItem?.id);
+      const next = e.key === "ArrowRight" ? idx + 1 : idx - 1;
+      if (next >= 0 && next < items.length) selectItem(items[next]);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [activeSection]);
   reactExports.useEffect(() => {
     window.__autoTagger = { setSelectedItems: setItems };
     const init = () => loadUserTags();

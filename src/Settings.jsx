@@ -57,10 +57,17 @@ const Toggle = ({ checked, onChange, label }) => (
   </label>
 );
 
+const DEFAULT_LIBRARY_INSTRUCTION =
+  `Select up to 5 tags from that list that clearly describe something visible in this image — art style, characters, clothing, or setting.\n` +
+  `Do NOT select organizational or collection tags (e.g. "Favorite", "Photos", "References", "To Sort") — only visual descriptions.\n` +
+  `Be selective. Only include a tag if you are confident it applies.`;
+
 const Settings = () => {
   const {
-    llmProvider, llmApiKey, llmModel, llmEndpoint, llmPrompt, llmIncludeLibraryTags,
-    promptPresets, autoSave, tagBlacklist,
+    llmProvider, llmApiKey,
+    llmModelOpenAI, llmModelAnthropic, llmModelLocal,
+    llmEndpoint, llmPrompt, llmIncludeLibraryTags, llmLibraryPrompt,
+    promptPresets, autoSave, generateOnSelect, tagBlacklist,
     update,
   } = useSettingsStore();
 
@@ -96,6 +103,9 @@ const Settings = () => {
 
       {/* General */}
       <Section title="General">
+        <Field label="Generate on select" hint="Automatically run the LLM when you click an image. Disable to browse without triggering generation — use the Generate button manually.">
+          <Toggle checked={generateOnSelect} onChange={(v) => update({ generateOnSelect: v })} label="Enabled" />
+        </Field>
         <Field label="Auto-save tags" hint="Automatically save generated tags to Eagle without clicking Save.">
           <Toggle checked={autoSave} onChange={(v) => update({ autoSave: v })} label="Enabled" />
         </Field>
@@ -206,28 +216,33 @@ const Settings = () => {
           </Field>
         )}
 
-        <Field
-          label="Model"
-          hint={
-            llmProvider === "local"
-              ? "Model name as shown in LM Studio / Ollama (e.g. llava, qwen2-vl). Must support vision."
-              : llmProvider === "openai"
-              ? "Leave blank to use gpt-4o-mini. Other options: gpt-4o"
-              : "Leave blank to use claude-haiku-4-5-20251001. Other options: claude-sonnet-4-6"
-          }
-        >
-          <TextInput
-            value={llmModel}
-            onChange={(v) => update({ llmModel: v })}
-            placeholder={
-              llmProvider === "local"
-                ? "llava"
-                : llmProvider === "openai"
-                ? "gpt-4o-mini"
-                : "claude-haiku-4-5-20251001"
-            }
-          />
-        </Field>
+        {llmProvider === "openai" && (
+          <Field label="Model" hint="Leave blank to use gpt-4o-mini.">
+            <TextInput
+              value={llmModelOpenAI}
+              onChange={(v) => update({ llmModelOpenAI: v })}
+              placeholder="gpt-4o-mini"
+            />
+          </Field>
+        )}
+        {llmProvider === "anthropic" && (
+          <Field label="Model" hint="Leave blank to use claude-haiku-4-5-20251001.">
+            <TextInput
+              value={llmModelAnthropic}
+              onChange={(v) => update({ llmModelAnthropic: v })}
+              placeholder="claude-haiku-4-5-20251001"
+            />
+          </Field>
+        )}
+        {llmProvider === "local" && (
+          <Field label="Model" hint="Model name as shown in LM Studio / Ollama (e.g. llava, qwen2-vl). Must support vision.">
+            <TextInput
+              value={llmModelLocal}
+              onChange={(v) => update({ llmModelLocal: v })}
+              placeholder="llava"
+            />
+          </Field>
+        )}
 
         <Field label="Prompt" hint="The instruction sent to the LLM with the image.">
           <div className="flex items-center gap-2">
@@ -307,6 +322,28 @@ const Settings = () => {
             onChange={(v) => update({ llmIncludeLibraryTags: v })}
             label="Enabled"
           />
+          {llmIncludeLibraryTags && (
+            <div className="flex flex-col gap-1.5 mt-2 pl-3 border-l-2 border-eagle-border">
+              <label className="text-xs font-medium text-eagle-text-secondary">Library matching instructions</label>
+              <textarea
+                value={llmLibraryPrompt || DEFAULT_LIBRARY_INSTRUCTION}
+                onChange={(e) => update({ llmLibraryPrompt: e.target.value })}
+                rows={4}
+                className="bg-eagle-btn-bg border border-eagle-border rounded-lg px-3 py-2 text-sm text-eagle-text focus:outline-none focus:border-eagle-accent transition-colors resize-y font-mono"
+              />
+              {llmLibraryPrompt && llmLibraryPrompt !== DEFAULT_LIBRARY_INSTRUCTION && (
+                <button
+                  onClick={() => update({ llmLibraryPrompt: "" })}
+                  className="text-xs text-eagle-text-muted hover:text-eagle-text self-start transition-colors"
+                >
+                  Reset to default
+                </button>
+              )}
+              <p className="text-xs text-eagle-text-muted">
+                This instruction follows the tag list. The JSON output format is fixed and appended automatically.
+              </p>
+            </div>
+          )}
         </Field>
       </Section>
     </div>
