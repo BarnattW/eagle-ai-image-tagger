@@ -10,16 +10,6 @@ import Gallery from "./Gallery";
 
 function syncSettingsToBridge(state) {
   window.__autoTaggerInference?.configure?.({
-    inferenceMode: state.inferenceMode,
-    modelPath: state.wd14ModelDir ? `${state.wd14ModelDir}/model.onnx` : (state.modelPath || null),
-    tagsPath: state.wd14ModelDir ? `${state.wd14ModelDir}/selected_tags.csv` : (state.tagsPath || null),
-    thresholdGeneral: state.thresholdGeneral,
-    thresholdCharacter: state.thresholdCharacter,
-    topN: state.topN,
-    clipEnabled: state.clipEnabled,
-    clipModelDir: state.clipModelDir,
-    clipThreshold: state.clipThreshold,
-    clipTopN: state.clipTopN,
     llmProvider: state.llmProvider,
     llmApiKey: state.llmApiKey,
     llmModel: state.llmModel,
@@ -59,12 +49,20 @@ export default function App() {
 
   useEffect(() => {
     window.__autoTagger = { setSelectedItems: setItems };
-    loadUserTags();
+
+    const init = () => loadUserTags();
+    if (window.__eagleReady) {
+      init();
+    } else {
+      window.addEventListener("eagle-ready", init, { once: true });
+    }
+
     syncSettingsToBridge(useSettingsStore.getState());
     const unsub = useSettingsStore.subscribe(syncSettingsToBridge);
     return () => {
       delete window.__autoTagger;
       unsub();
+      window.removeEventListener("eagle-ready", init);
     };
   }, []);
 

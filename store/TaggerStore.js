@@ -69,7 +69,8 @@ export const useTaggerStore = create((set, get) => ({
     try {
       const tags = await fetchUserTags();
       set({ userTags: tags });
-    } catch {
+    } catch (e) {
+      console.error("loadUserTags failed:", e);
       set({ userTags: [] });
     }
   },
