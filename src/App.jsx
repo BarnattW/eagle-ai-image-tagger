@@ -59,12 +59,20 @@ export default function App() {
 
   useEffect(() => {
     window.__autoTagger = { setSelectedItems: setItems };
-    loadUserTags();
+
+    const init = () => loadUserTags();
+    if (window.__eagleReady) {
+      init();
+    } else {
+      window.addEventListener("eagle-ready", init, { once: true });
+    }
+
     syncSettingsToBridge(useSettingsStore.getState());
     const unsub = useSettingsStore.subscribe(syncSettingsToBridge);
     return () => {
       delete window.__autoTagger;
       unsub();
+      window.removeEventListener("eagle-ready", init);
     };
   }, []);
 

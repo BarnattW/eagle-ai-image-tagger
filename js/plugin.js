@@ -12,6 +12,8 @@ function applyTheme(theme) {
 eagle.onPluginCreate(async () => {
   const theme = await eagle.app.theme;
   applyTheme(theme);
+  window.__eagleReady = true;
+  window.dispatchEvent(new Event("eagle-ready"));
 });
 
 eagle.onThemeChanged((theme) => applyTheme(theme));
