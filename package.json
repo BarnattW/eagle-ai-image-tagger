@@ -3,7 +3,8 @@
     "dev": "vite",
     "build": "vite build",
     "build:watch": "vite build --watch",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "package": "npm install --omit=dev"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.7.0",

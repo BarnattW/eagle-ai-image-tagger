@@ -3,7 +3,7 @@ const path = require("path");
 
 const DEFAULT_PROMPT =
   `IMPORTANT: Output ONLY valid JSON. NO explanations, NO markdown, NO extra text.` +
-  `Analyze this image and generate 15-25 accurate Danbooru-style tags.\n` +
+  `Analyze this image and generate 10-15 accurate Danbooru-style tags.\n` +
   `Cover all of the following categories that apply:\n` +
   `- Subject: 1girl, 1boy, multiple girls, no humans, animal, etc.\n` +
   `- Art style: anime, manga, realistic, painterly, sketch, chibi, pixel art, etc.\n` +
@@ -23,6 +23,11 @@ const DEFAULT_MODELS = {
   anthropic: "claude-haiku-4-5-20251001",
 };
 
+const DEFAULT_LIBRARY_INSTRUCTION =
+  `Select up to 5 tags from that list that clearly describe something visible in this image — art style, characters, clothing, or setting.\n` +
+  `Do NOT select organizational or collection tags (e.g. "Favorite", "Photos", "References", "To Sort") — only visual descriptions.\n` +
+  `Be selective. Only include a tag if you are confident it applies.`;
+
 let llmConfig = {
   enabled: false,
   provider: "openai",
@@ -31,6 +36,7 @@ let llmConfig = {
   endpoint: "http://localhost:1234/v1",
   prompt: "",
   includeLibraryTags: true,
+  libraryPrompt: "",
 };
 
 function configure(patch) {
@@ -57,19 +63,18 @@ function getMimeType(imagePath) {
 function buildPrompt(userTags) {
   const base = llmConfig.prompt.trim() || DEFAULT_PROMPT;
   if (llmConfig.includeLibraryTags && userTags?.length > 0) {
-    const tagList = userTags.slice(0, 150).join(", ");
+    const tagList = userTags.slice(0, 200).join(", ");
+    const libraryInstruction = llmConfig.libraryPrompt?.trim() || DEFAULT_LIBRARY_INSTRUCTION;
     return (
       `${base}\n\n` +
-      `STEP 2 — Library matching:\n` +
-      `From this list of my existing tags: ${tagList}\n` +
-      `Select ONLY tags that are a direct, confident match to something clearly visible in this image.\n` +
-      `Rules: do not include a library tag unless you are certain it applies. Prefer no matches over wrong matches.\n\n` +
-      `Return ONLY JSON. No explanations, no markdown, no extra text.
-      Output exactly in this format:
-    {"tags": ["tag1", ...], "library": ["tag1", ...]}`
+      `LIBRARY MATCHING:\n` +
+      `Here are tags already in my collection: ${tagList}\n` +
+      `${libraryInstruction}\n\n` +
+      `Output ONLY this JSON (no explanations, no markdown):\n` +
+      `{"tags": ["newly generated tags"], "library": ["matched library tags"]}`
     );
   }
-  return `${base}\n\nReturn ONLY a JSON array (No explanations, no markdown, no extra text) in this format: ["tag1", "tag2", ...]`;
+  return `${base}\n\nOutput ONLY a JSON array (no explanations, no markdown): ["tag1", "tag2", ...]`;
 }
 
 async function callOpenAI(
@@ -80,9 +85,9 @@ async function callOpenAI(
   apiKey,
   baseUrl = "https://api.openai.com/v1",
   isLocal = false,
+  signal,
 ) {
   const url = `${baseUrl.replace(/\/$/, "")}/chat/completions`;
-  console.log("Making OpenAI request to url:", url);
   const headers = { "Content-Type": "application/json" };
   if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
 
@@ -112,6 +117,7 @@ async function callOpenAI(
   const response = await fetch(url, {
     method: "POST",
     headers,
+    signal,
     body: JSON.stringify({
       model: model || DEFAULT_MODELS.openai,
       messages,
@@ -127,7 +133,7 @@ async function callOpenAI(
   return (msg.content ?? "").replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
 }
 
-async function callAnthropic(base64Image, mimeType, prompt, model, apiKey) {
+async function callAnthropic(base64Image, mimeType, prompt, model, apiKey, signal) {
   const response = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -135,6 +141,7 @@ async function callAnthropic(base64Image, mimeType, prompt, model, apiKey) {
       "x-api-key": apiKey,
       "anthropic-version": "2023-06-01",
     },
+    signal,
     body: JSON.stringify({
       model: model || DEFAULT_MODELS.anthropic,
       max_tokens: 512,
@@ -190,7 +197,7 @@ function parseTags(rawText, hasLibrary) {
   }
 }
 
-async function llmGenerateTags(imagePath, userTags = [], thumbnailPath = null) {
+async function llmGenerateTags(imagePath, userTags = [], thumbnailPath = null, signal) {
   const isLocal = llmConfig.provider === "local";
   if (!llmConfig.enabled || (!isLocal && !llmConfig.apiKey) || !imagePath)
     return { tags: [], library: [] };
@@ -206,7 +213,6 @@ async function llmGenerateTags(imagePath, userTags = [], thumbnailPath = null) {
       llmConfig.model ||
       DEFAULT_MODELS[llmConfig.provider] ||
       DEFAULT_MODELS.openai;
-
     const rawText =
       llmConfig.provider === "anthropic"
         ? await callAnthropic(
@@ -215,6 +221,7 @@ async function llmGenerateTags(imagePath, userTags = [], thumbnailPath = null) {
             prompt,
             model,
             llmConfig.apiKey,
+            signal,
           )
         : await callOpenAI(
             base64Image,
@@ -224,12 +231,13 @@ async function llmGenerateTags(imagePath, userTags = [], thumbnailPath = null) {
             llmConfig.apiKey,
             isLocal ? llmConfig.endpoint : undefined,
             isLocal,
+            signal,
           );
 
     const { tags, library } = parseTags(rawText, hasLibrary);
     return {
       tags: tags.filter((t) => typeof t === "string" && t.trim()),
-      library: library.filter((t) => typeof t === "string" && t.trim()),
+      library: library.slice(0, 5).filter((t) => typeof t === "string" && t.trim()),
     };
   } catch (err) {
     console.error("LLM error:", err.message);
@@ -237,4 +245,4 @@ async function llmGenerateTags(imagePath, userTags = [], thumbnailPath = null) {
   }
 }
 
-module.exports = { llmGenerateTags, configure, DEFAULT_PROMPT };
+module.exports = { llmGenerateTags, configure, DEFAULT_PROMPT, DEFAULT_LIBRARY_INSTRUCTION };

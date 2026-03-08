@@ -77,9 +77,11 @@ Switch inference mode to **LLM** in Settings.
 | Anthropic | API key, optionally a model name (default: `claude-haiku-4-5`) |
 | Local | Endpoint URL (default: `http://localhost:1234/v1`), model name |
 
-**Recommended local vision models** (via LM Studio): Tested with Gemma3-4B
+**Recommended local vision models** (via LM Studio): 
+Gemma3-4B - more inaccurate library tag matching but fast
+Qwen3.5 9B and Qwen3 VL 4B are excellent 
 
-> Reasoning models (Qwen3, DeepSeek-R1) are not ideal — their chain-of-thought output consumes context before producing JSON.
+> Reasoning models (Qwen3, DeepSeek-R1) can take a lot longer — their chain-of-thought output consumes context before producing JSON.
 
 ## Usage
 

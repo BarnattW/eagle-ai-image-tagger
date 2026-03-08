@@ -9,23 +9,19 @@ import Settings from "./Settings";
 import Gallery from "./Gallery";
 
 function syncSettingsToBridge(state) {
+  const modelByProvider = {
+    openai: state.llmModelOpenAI,
+    anthropic: state.llmModelAnthropic,
+    local: state.llmModelLocal,
+  };
   window.__autoTaggerInference?.configure?.({
-    inferenceMode: state.inferenceMode,
-    modelPath: state.wd14ModelDir ? `${state.wd14ModelDir}/model.onnx` : (state.modelPath || null),
-    tagsPath: state.wd14ModelDir ? `${state.wd14ModelDir}/selected_tags.csv` : (state.tagsPath || null),
-    thresholdGeneral: state.thresholdGeneral,
-    thresholdCharacter: state.thresholdCharacter,
-    topN: state.topN,
-    clipEnabled: state.clipEnabled,
-    clipModelDir: state.clipModelDir,
-    clipThreshold: state.clipThreshold,
-    clipTopN: state.clipTopN,
     llmProvider: state.llmProvider,
     llmApiKey: state.llmApiKey,
-    llmModel: state.llmModel,
+    llmModel: modelByProvider[state.llmProvider] || "",
     llmEndpoint: state.llmEndpoint,
     llmPrompt: state.llmPrompt,
     llmIncludeLibraryTags: state.llmIncludeLibraryTags,
+    llmLibraryPrompt: state.llmLibraryPrompt,
   });
 }
 
@@ -56,6 +52,20 @@ class ErrorBoundary extends Component {
 export default function App() {
   const [activeSection, setActiveSection] = useState("auto");
   const { setItems, loadUserTags } = useTaggerStore();
+
+  useEffect(() => {
+    if (activeSection !== "auto") return;
+    const onKey = (e) => {
+      if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+      const { items, selectedItem, selectItem } = useTaggerStore.getState();
+      const idx = items.findIndex((x) => x.id === selectedItem?.id);
+      const next = e.key === "ArrowRight" ? idx + 1 : idx - 1;
+      if (next >= 0 && next < items.length) selectItem(items[next]);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [activeSection]);
 
   useEffect(() => {
     window.__autoTagger = { setSelectedItems: setItems };

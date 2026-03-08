@@ -6,6 +6,7 @@ export default defineConfig({
   plugins: [react()],
   base: './',
   build: {
+    minify: false,
     outDir: 'dist',
     rollupOptions: {
       // Explicit entry so Vite doesn't rely on finding <script type="module"> in index.html

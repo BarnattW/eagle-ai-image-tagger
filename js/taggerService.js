@@ -1,19 +1,7 @@
-export async function runTaggerLatest(filePath) {
-  const bridge = window.__autoTaggerInference;
-  if (!bridge?.runTaggerLatest) throw new Error("Inference bridge not ready");
-  return await bridge.runTaggerLatest(filePath);
-}
-
-export async function clipSuggestTags(imagePath, candidateTags, wd14Tags) {
-  const bridge = window.__autoTaggerInference;
-  if (!bridge?.clipSuggestTags) throw new Error("Inference bridge not ready");
-  return await bridge.clipSuggestTags(imagePath, candidateTags, wd14Tags);
-}
-
-export async function llmGenerateTags(imagePath, userTags) {
+export async function llmGenerateTags(imagePath, userTags, thumbnailPath) {
   const bridge = window.__autoTaggerInference;
   if (!bridge?.llmGenerateTags) throw new Error("Inference bridge not ready");
-  return await bridge.llmGenerateTags(imagePath, userTags);
+  return await bridge.llmGenerateTags(imagePath, userTags, thumbnailPath);
 }
 
 function normalizeTag(tag) {

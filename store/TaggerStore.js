@@ -1,12 +1,10 @@
 import { create } from "zustand";
-import { dedupeTags, runTaggerLatest, clipSuggestTags, llmGenerateTags } from "../js/taggerService";
+import { dedupeTags, llmGenerateTags } from "../js/taggerService";
 import { fetchUserTags, saveTagsToItem } from "../js/eagleService";
 import { useSettingsStore } from "./settingsStore";
 
 function humanizeError(err) {
   const msg = err?.message || String(err);
-  if (msg.includes("ENOENT") || msg.includes("no such file"))
-    return "Model file not found. Check the paths in Settings.";
   if (msg.includes("ERR_CONNECTION_REFUSED") || msg.includes("Failed to fetch"))
     return "Could not connect to the LLM server. Is it running?";
   if (msg.includes("401") || msg.includes("Unauthorized"))
@@ -20,6 +18,47 @@ function humanizeError(err) {
   return msg;
 }
 
+// Module-level state for in-flight request management
+let activeAbortController = null;
+let debounceTimer = null;
+
+async function runGeneration(item, signal, get, set) {
+  const { tagBlacklist, autoSave } = useSettingsStore.getState();
+  const blacklist = new Set((tagBlacklist || []).map((t) => t.toLowerCase()));
+  const existing = item.tags || [];
+  const cleanTags = (tags) =>
+    dedupeTags(
+      Array.isArray(tags) ? tags.filter((t) => !blacklist.has(t.toLowerCase())) : [],
+      existing
+    );
+
+  set({ isGenerating: true });
+  try {
+    const userTags = get().userTags.map((t) => (typeof t === "string" ? t : t.name));
+    const { tags, library } = await llmGenerateTags(item.filePath, userTags, item.thumbnailPath, signal);
+    if (signal.aborted || get().selectedItem?.id !== item.id) return;
+    set({ autoTags: cleanTags(tags), clipTags: cleanTags(library) });
+    if (autoSave && get().autoTags.length > 0) await get().saveTags();
+  } catch (err) {
+    if (err.name === "AbortError") return;
+    console.error(err);
+    if (get().selectedItem?.id === item.id)
+      set({ autoTags: [], clipTags: [], inferenceError: humanizeError(err) });
+  } finally {
+    if (!signal.aborted && get().selectedItem?.id === item.id) set({ isGenerating: false });
+  }
+}
+
+// Shared helper: persist an Eagle item's mutated tags back into Zustand state.
+// Keeps the same object reference (spreading loses non-enumerable/prototype props).
+function commitItem(set, item, extra = {}) {
+  set((state) => ({
+    tagVersion: state.tagVersion + 1,
+    allItems: state.allItems.map((x) => x.id === item.id ? item : x),
+    ...extra,
+  }));
+}
+
 export const useTaggerStore = create((set, get) => ({
   items: [],
   selectedItem: null,
@@ -27,11 +66,11 @@ export const useTaggerStore = create((set, get) => ({
   clipTags: [],
   isGenerating: false,
   inferenceError: null,
-  clipWarning: null,
   userTags: [],
   allItems: [],
   batchProgress: null, // { current, total } | null
   batchCancelled: false,
+  tagVersion: 0, // incremented on save/clear to force re-renders without replacing the Eagle item object
 
   setItems: (newItems) => {
     const arr = newItems || [];
@@ -42,64 +81,49 @@ export const useTaggerStore = create((set, get) => ({
     }
   },
 
-  selectItem: async (item) => {
-    set({ selectedItem: item, isGenerating: true, autoTags: [], clipTags: [], inferenceError: null, clipWarning: null });
-    const { inferenceMode, clipEnabled, tagBlacklist, autoSave } = useSettingsStore.getState();
-    const blacklist = new Set((tagBlacklist || []).map((t) => t.toLowerCase()));
-    const existing = item.tags || [];
-    const cleanTags = (tags) =>
-      dedupeTags(
-        Array.isArray(tags) ? tags.filter((t) => !blacklist.has(t.toLowerCase())) : [],
-        existing
-      );
+  selectItem: (item) => {
+    // Abort any in-flight request and clear pending debounce
+    if (activeAbortController) activeAbortController.abort();
+    clearTimeout(debounceTimer);
 
-    try {
-      if (inferenceMode === "llm") {
-        const userTags = get().userTags.map((t) => (typeof t === "string" ? t : t.name));
-        const { tags, library } = await llmGenerateTags(item.filePath, userTags, item.thumbnailPath);
-        if (get().selectedItem?.id !== item.id) return;
-        set({ autoTags: cleanTags(tags), clipTags: cleanTags(library) });
-        if (autoSave && get().autoTags.length > 0) await get().saveTags();
-      } else {
-        // Local: WD14 first, show immediately, then CLIP in background
-        const genTags = await runTaggerLatest(item.filePath);
-        if (get().selectedItem?.id !== item.id) return;
-        set({ autoTags: cleanTags(genTags), isGenerating: false });
-        if (autoSave && get().autoTags.length > 0) await get().saveTags();
+    // Immediately update UI — image preview switches instantly
+    set({ selectedItem: item, autoTags: [], clipTags: [], isGenerating: false, inferenceError: null });
 
-        if (clipEnabled) {
-          try {
-            const userTags = get().userTags.map((t) => (typeof t === "string" ? t : t.name));
-            const suggested = await clipSuggestTags(
-              item.filePath,
-              userTags,
-              Array.isArray(genTags) ? genTags : []
-            );
-            if (get().selectedItem?.id !== item.id) return;
-            set({ clipTags: cleanTags(suggested) });
-          } catch (clipErr) {
-            if (get().selectedItem?.id === item.id)
-              set({ clipWarning: humanizeError(clipErr) });
-          }
-        }
-      }
-    } catch (err) {
-      console.error(err);
-      if (get().selectedItem?.id === item.id)
-        set({ autoTags: [], clipTags: [], inferenceError: humanizeError(err) });
-    } finally {
-      if (get().selectedItem?.id === item.id) set({ isGenerating: false });
-    }
+    const { generateOnSelect } = useSettingsStore.getState();
+    if (!generateOnSelect) return;
+
+    // Debounce: only start the LLM request after the user has settled on this image.
+    // This prevents flooding the server when navigating quickly.
+    debounceTimer = setTimeout(() => {
+      if (get().selectedItem?.id !== item.id) return;
+      activeAbortController = new AbortController();
+      runGeneration(item, activeAbortController.signal, get, set);
+    }, 400);
+  },
+
+  // Explicitly trigger generation for the current item, ignoring generateOnSelect.
+  // Used by the Generate / Regenerate button so it always works regardless of that setting.
+  generateItem: () => {
+    const { selectedItem } = get();
+    if (!selectedItem) return;
+    if (activeAbortController) activeAbortController.abort();
+    clearTimeout(debounceTimer);
+    set({ autoTags: [], clipTags: [], isGenerating: false, inferenceError: null });
+    activeAbortController = new AbortController();
+    runGeneration(selectedItem, activeAbortController.signal, get, set);
   },
 
   loadUserTags: async () => {
     try {
       const tags = await fetchUserTags();
       set({ userTags: tags });
-    } catch {
+    } catch (e) {
+      console.error("loadUserTags failed:", e);
       set({ userTags: [] });
     }
   },
+
+  clearTags: () => set({ autoTags: [], clipTags: [] }),
 
   addAutoTag: (tag) =>
     set((state) => ({
@@ -129,20 +153,21 @@ export const useTaggerStore = create((set, get) => ({
     set({ batchProgress: { current: 0, total: items.length }, batchCancelled: false });
     const { tagBlacklist } = useSettingsStore.getState();
     const blacklist = new Set((tagBlacklist || []).map((t) => t.toLowerCase()));
-
     for (let i = 0; i < items.length; i++) {
       if (get().batchCancelled) break;
       const item = items[i];
       try {
-        const genTags = await runTaggerLatest(item.filePath);
-        const filtered = (genTags || []).filter((t) => !blacklist.has(t.toLowerCase()));
+        // Pass empty userTags in batch mode — no library matching, just generate fresh tags
+        const { tags } = await llmGenerateTags(item.filePath, [], item.thumbnailPath);
+        const allTags = tags || [];
+        const filtered = allTags.filter((t) => !blacklist.has(t.toLowerCase()));
         if (filtered.length) {
-          const tags = dedupeTags(filtered, item.tags);
-          if (tags.length) {
-            await saveTagsToItem(item, tags);
+          const newTags = dedupeTags(filtered, item.tags);
+          if (newTags.length) {
+            await saveTagsToItem(item, newTags);
             set((state) => ({
               allItems: state.allItems.map((x) =>
-                x.id === item.id ? { ...x, tags: [...x.tags, ...tags] } : x
+                x.id === item.id ? { ...x, tags: [...x.tags, ...newTags] } : x
               ),
             }));
           }
@@ -156,15 +181,27 @@ export const useTaggerStore = create((set, get) => ({
     set({ batchProgress: null, batchCancelled: false });
   },
 
+  removeItemTag: async (tag) => {
+    const { selectedItem } = get();
+    if (!selectedItem) return;
+    selectedItem.tags = selectedItem.tags.filter((t) => t !== tag);
+    await selectedItem.save();
+    commitItem(set, selectedItem);
+  },
+
+  clearItemTags: async () => {
+    const { selectedItem } = get();
+    if (!selectedItem) return;
+    selectedItem.tags = [];
+    await selectedItem.save();
+    commitItem(set, selectedItem, { autoTags: [], clipTags: [] });
+  },
+
   saveTags: async () => {
     const { selectedItem, autoTags } = get();
     if (!selectedItem || autoTags.length === 0) return;
     const newTags = dedupeTags(autoTags, selectedItem.tags);
-    await saveTagsToItem(selectedItem, newTags);
-    set({
-      autoTags: [],
-      clipTags: [],
-      selectedItem: { ...selectedItem, tags: [...selectedItem.tags, ...newTags] },
-    });
+    await saveTagsToItem(selectedItem, newTags); // mutates selectedItem.tags in place
+    commitItem(set, selectedItem, { autoTags: [], clipTags: [] });
   },
 }));
