@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { dedupeTags, llmGenerateTags } from "../js/taggerService";
+import { dedupeTags, llmGenerateTags, indexLibraryTags } from "../js/taggerService";
 import { fetchUserTags, saveTagsToItem } from "../js/eagleService";
 import { useSettingsStore } from "./settingsStore";
 
@@ -34,8 +34,7 @@ async function runGeneration(item, signal, get, set) {
 
   set({ isGenerating: true });
   try {
-    const userTags = get().userTags.map((t) => (typeof t === "string" ? t : t.name));
-    const { tags, library } = await llmGenerateTags(item.filePath, userTags, item.thumbnailPath, signal);
+    const { tags, library } = await llmGenerateTags(item.filePath, item.thumbnailPath, signal);
     if (signal.aborted || get().selectedItem?.id !== item.id) return;
     set({ autoTags: cleanTags(tags), clipTags: cleanTags(library) });
     if (autoSave && get().autoTags.length > 0) await get().saveTags();
@@ -117,6 +116,8 @@ export const useTaggerStore = create((set, get) => ({
     try {
       const tags = await fetchUserTags();
       set({ userTags: tags });
+      const tagNames = tags.map((t) => (typeof t === "string" ? t : t.name));
+      indexLibraryTags(tagNames);
     } catch (e) {
       console.error("loadUserTags failed:", e);
       set({ userTags: [] });
@@ -158,7 +159,7 @@ export const useTaggerStore = create((set, get) => ({
       const item = items[i];
       try {
         // Pass empty userTags in batch mode — no library matching, just generate fresh tags
-        const { tags } = await llmGenerateTags(item.filePath, [], item.thumbnailPath);
+        const { tags } = await llmGenerateTags(item.filePath, item.thumbnailPath);
         const allTags = tags || [];
         const filtered = allTags.filter((t) => !blacklist.has(t.toLowerCase()));
         if (filtered.length) {

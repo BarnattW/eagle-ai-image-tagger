@@ -15,13 +15,6 @@ const TagPicker = ({ onSelect, onMultiSelect, onClose, excludeTags = [], style, 
   const userTags = useTaggerStore((state) => state.userTags);
   const inputRef = useRef(null);
 
-  useEffect(() => {
-    inputRef.current?.focus();
-    const onKey = (e) => { if (e.key === "Escape") onClose(); };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
   const excludeSet = useMemo(
     () => new Set(excludeTags.map((t) => t.toLowerCase())),
     [excludeTags]
@@ -38,9 +31,27 @@ const TagPicker = ({ onSelect, onMultiSelect, onClose, excludeTags = [], style, 
   const recent = filtered.slice(0, 12);
   const others = filtered.slice(12);
 
+  const trimmed = search.trim();
+  const canCreate = !multi && trimmed.length > 0 && !excludeSet.has(trimmed.toLowerCase()) &&
+    !filtered.some((t) => (typeof t === "string" ? t : t.name).toLowerCase() === trimmed.toLowerCase());
+
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
+
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === "Escape") onClose();
+      if (e.key === "Enter" && canCreate) { onSelect(trimmed); onClose(); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose, onSelect, canCreate, trimmed]);
+
   const handleClick = (name) => {
     if (!multi) {
       onSelect(name);
+      onClose();
       return;
     }
     setPending((prev) => {
@@ -118,11 +129,23 @@ const TagPicker = ({ onSelect, onMultiSelect, onClose, excludeTags = [], style, 
         </div>
 
         <div className="overflow-y-auto max-h-64 custom-scrollbar [scrollbar-gutter:stable]">
-          {filtered.length === 0 ? (
+          {canCreate && (
+            <div className="p-1.5 border-b border-eagle-border">
+              <button
+                onClick={() => { onSelect(trimmed); onClose(); }}
+                className="w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-left hover:bg-eagle-btn-hover transition-colors"
+              >
+                <span className="text-eagle-accent text-sm font-medium">+</span>
+                <span className="text-xs text-eagle-text">Create &ldquo;{trimmed}&rdquo;</span>
+                <span className="ml-auto text-xs text-eagle-text-muted">↵</span>
+              </button>
+            </div>
+          )}
+          {filtered.length === 0 && !canCreate ? (
             <p className="text-center text-eagle-text-muted text-xs py-6">
               {userTags.length === 0 ? "No tags in library" : "No matching tags"}
             </p>
-          ) : (
+          ) : filtered.length > 0 ? (
             <div className="p-1.5 flex flex-col gap-2">
               {recent.length > 0 && (
                 <div>
@@ -141,7 +164,7 @@ const TagPicker = ({ onSelect, onMultiSelect, onClose, excludeTags = [], style, 
                 </div>
               )}
             </div>
-          )}
+          ) : null}
         </div>
 
         <div className="border-t border-eagle-border px-3 py-1.5 flex items-center gap-2 text-xs select-none">

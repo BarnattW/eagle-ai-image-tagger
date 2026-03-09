@@ -14,6 +14,7 @@ export const useSettingsStore = create(
       llmPrompt: "",          // empty = use built-in default
       llmIncludeLibraryTags: true,
       llmLibraryPrompt: "",   // empty = use built-in default
+      llmMaxTokens: 800,      // output token limit for local models (cloud uses fixed defaults)
       promptPresets: [],      // [{ name: string, prompt: string }]
 
       // --- General ---

@@ -22,6 +22,7 @@ function syncSettingsToBridge(state) {
     llmPrompt: state.llmPrompt,
     llmIncludeLibraryTags: state.llmIncludeLibraryTags,
     llmLibraryPrompt: state.llmLibraryPrompt,
+    llmMaxTokens: state.llmMaxTokens,
   });
 }
 

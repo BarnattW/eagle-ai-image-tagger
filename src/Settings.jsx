@@ -66,7 +66,7 @@ const Settings = () => {
   const {
     llmProvider, llmApiKey,
     llmModelOpenAI, llmModelAnthropic, llmModelLocal,
-    llmEndpoint, llmPrompt, llmIncludeLibraryTags, llmLibraryPrompt,
+    llmEndpoint, llmPrompt, llmIncludeLibraryTags, llmLibraryPrompt, llmMaxTokens,
     promptPresets, autoSave, generateOnSelect, tagBlacklist,
     update,
   } = useSettingsStore();
@@ -240,6 +240,16 @@ const Settings = () => {
               value={llmModelLocal}
               onChange={(v) => update({ llmModelLocal: v })}
               placeholder="llava"
+            />
+          </Field>
+        )}
+        {llmProvider === "local" && (
+          <Field label="Max output tokens" hint="Caps the model's response length. 800 is enough for 25 tags. Raise this for reasoning models that emit chain-of-thought before the JSON.">
+            <TextInput
+              type="number"
+              value={String(llmMaxTokens)}
+              onChange={(v) => { const n = parseInt(v); if (!isNaN(n) && n > 0) update({ llmMaxTokens: n }); }}
+              placeholder="800"
             />
           </Field>
         )}

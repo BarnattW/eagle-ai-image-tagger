@@ -1,7 +1,10 @@
 .claude/
 
 /node_modules/
+/.cache/
 test.ipynb
 
 /inference/model.onnx
 /inference/selected_tags.csv
+
+package-lock.json
