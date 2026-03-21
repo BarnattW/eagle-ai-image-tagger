@@ -120,8 +120,8 @@ async function callOpenAI(
       model: model || DEFAULT_MODELS.openai,
       messages,
       max_tokens: isLocal ? llmConfig.maxTokens || 800 : 1024,
-      // Hint for LM Studio / llama.cpp to disable thinking mode
-      chat_template_kwargs: { enable_thinking: false },
+      // Hint for LM Studio / llama.cpp to disable thinking mode (not supported by OpenAI)
+      ...(isLocal && { chat_template_kwargs: { enable_thinking: false } }),
     }),
   });
   if (!response.ok)
@@ -220,7 +220,8 @@ async function callOpenAIText(prompt, model, apiKey, baseUrl, isLocal, signal) {
       model,
       messages,
       max_tokens: 200,
-      chat_template_kwargs: { enable_thinking: false },
+      // Hint for LM Studio / llama.cpp to disable thinking mode (not supported by OpenAI)
+      ...(isLocal && { chat_template_kwargs: { enable_thinking: false } }),
     }),
   });
   if (!response.ok)
