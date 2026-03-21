@@ -7415,11 +7415,15 @@ const useTaggerStore = create((set, get) => ({
     set({ batchProgress: { current: 0, total: items.length }, batchCancelled: false });
     const { tagBlacklist } = useSettingsStore.getState();
     const blacklist = new Set((tagBlacklist || []).map((t) => t.toLowerCase()));
+    const batchController = new AbortController();
     for (let i = 0; i < items.length; i++) {
-      if (get().batchCancelled) break;
+      if (get().batchCancelled) {
+        batchController.abort();
+        break;
+      }
       const item = items[i];
       try {
-        const { tags } = await llmGenerateTags(item.filePath, item.thumbnailPath);
+        const { tags } = await llmGenerateTags(item.filePath, item.thumbnailPath, batchController.signal);
         const allTags = tags || [];
         const filtered = allTags.filter((t) => !blacklist.has(t.toLowerCase()));
         if (filtered.length) {
