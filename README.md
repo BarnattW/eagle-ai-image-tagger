@@ -1,6 +1,8 @@
 # AI Image Tagger
 ![GitHub release](https://img.shields.io/github/v/release/BarnattW/eagle-ai-image-tagger)
 
+[Eagle release](https://community-en.eagle.cool/plugin/a5a18212-4847-476c-961f-4550ab8b299b)
+
 An [Eagle](https://eagle.cool) plugin that automatically tags images using AI. Supports cloud and local LLMs with intelligent library tag matching.
 
 ![Gallery view](screenshots/gallery.png)
